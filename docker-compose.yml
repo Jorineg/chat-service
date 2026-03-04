@@ -1,0 +1,23 @@
+services:
+  chat-service:
+    build: .
+    container_name: ibhelm-chat-service
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - .env
+    networks:
+      - supabase_default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+networks:
+  supabase_default:
+    external: true

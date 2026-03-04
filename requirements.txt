@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+asyncpg
+anthropic
+openai
+PyJWT
+python-dotenv
+logtail-python
