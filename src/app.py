@@ -14,10 +14,8 @@ from pydantic import BaseModel
 from . import settings
 from .auth import get_current_user
 from .database import get_pool, close_pool
-from .llm import (
-    stream_chat_response, generate_title,
-    get_model_configs, invalidate_model_cache,
-)
+from .llm import get_model_configs, invalidate_model_cache
+from . import tasks
 
 logger = logging.getLogger("ibhelm.chat")
 
@@ -158,7 +156,7 @@ async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(404, "Session not found")
 
     rows = await pool.fetch(
-        """SELECT id, role, content, blocks, metadata, created_at
+        """SELECT id, role, content, blocks, metadata, status, created_at
            FROM chat_messages WHERE session_id = $1
            ORDER BY created_at ASC""",
         session_id
@@ -167,6 +165,7 @@ async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
         {"id": str(r["id"]), "role": r["role"], "content": r["content"],
          "blocks": json.loads(r["blocks"]) if r["blocks"] else None,
          "metadata": json.loads(r["metadata"]) if r["metadata"] else None,
+         "status": r["status"],
          "created_at": r["created_at"].isoformat()}
         for r in rows
     ]
@@ -241,15 +240,28 @@ async def send_message(session_id: str, body: MessageCreate, user: dict = Depend
     if not session:
         raise HTTPException(404, "Session not found")
 
+    if tasks.has_active(session_id):
+        raise HTTPException(409, "Generation already in progress for this session")
+
+    # Insert user message
     user_msg_row = await pool.fetchrow(
         "INSERT INTO chat_messages (session_id, role, content) VALUES ($1, 'user', $2) RETURNING id",
         session_id, body.content
     )
     user_msg_id = str(user_msg_row["id"])
 
+    # Insert placeholder assistant message
+    asst_msg_row = await pool.fetchrow(
+        "INSERT INTO chat_messages (session_id, role, status) VALUES ($1, 'assistant', 'generating') RETURNING id",
+        session_id
+    )
+    asst_msg_id = str(asst_msg_row["id"])
+
+    # Load history (excluding the generating placeholder)
     history_rows = await pool.fetch(
         """SELECT role, content, blocks, created_at FROM chat_messages
-           WHERE session_id = $1 ORDER BY created_at ASC""",
+           WHERE session_id = $1 AND status = 'complete'
+           ORDER BY created_at ASC""",
         session_id
     )
     history = [
@@ -259,62 +271,48 @@ async def send_message(session_id: str, body: MessageCreate, user: dict = Depend
         for r in history_rows
     ]
 
-    # Fire title generation in background for first message (parallel to response)
-    title_task: asyncio.Task | None = None
-    if not session["title"] and len(history) <= 1:
-        async def _generate_and_save_title():
-            try:
-                title = await generate_title(body.content, pool)
-                await pool.execute(
-                    "UPDATE chat_sessions SET title = $1 WHERE id = $2",
-                    title, session_id
-                )
-                return title
-            except Exception as e:
-                logger.warning("Background title generation failed: %s", e)
-                return None
-        title_task = asyncio.create_task(_generate_and_save_title())
+    # Create and register the generation task
+    gen = tasks.GenerationTask(session_id=session_id, assistant_msg_id=asst_msg_id)
+    gen.task = asyncio.create_task(tasks.run_generation(
+        gen, history, pool, user_email, body.model,
+        body.content, session["title"],
+    ))
+    tasks.register(session_id, gen)
+
+    # SSE stream tails the task's events
+    async def sse_stream():
+        yield f"data: {json.dumps({'type': 'user_message_id', 'id': user_msg_id})}\n\n"
+        yield f"data: {json.dumps({'type': 'assistant_message_id', 'id': asst_msg_id})}\n\n"
+
+        async for event in gen.tail():
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        sse_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+@app.get("/sessions/{session_id}/stream")
+async def stream_session(session_id: str, user: dict = Depends(get_current_user)):
+    """Reconnect to an active generation's SSE stream."""
+    pool = await get_pool()
+    user_id = user["sub"]
+    session = await pool.fetchrow(
+        "SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        session_id, user_id
+    )
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    gen = tasks.get_active(session_id)
+    if not gen:
+        return {"status": "no_active_generation"}
 
     async def sse_stream():
-        final_content = ""
-        final_blocks = None
-        final_metadata = None
-
-        try:
-            yield f"data: {json.dumps({'type': 'user_message_id', 'id': user_msg_id})}\n\n"
-
-            async for event in stream_chat_response(history, pool, user_email, body.model):
-                if event["type"] == "done":
-                    final_content = event.get("content", "")
-                    final_blocks = event.get("blocks")
-                    final_metadata = event.get("metadata")
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-            await pool.execute(
-                """INSERT INTO chat_messages (session_id, role, content, blocks, metadata)
-                   VALUES ($1, 'assistant', $2, $3, $4)""",
-                session_id, final_content,
-                json.dumps(final_blocks, ensure_ascii=False) if final_blocks else None,
-                json.dumps(final_metadata, ensure_ascii=False) if final_metadata else None,
-            )
-
-            await pool.execute(
-                "UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1",
-                session_id
-            )
-
-            # Emit title if the background task finished (or wait briefly)
-            if title_task:
-                try:
-                    title = await asyncio.wait_for(asyncio.shield(title_task), timeout=5.0)
-                    if title:
-                        yield f"data: {json.dumps({'type': 'title', 'title': title}, ensure_ascii=False)}\n\n"
-                except asyncio.TimeoutError:
-                    pass
-
-        except Exception as e:
-            logger.error("Stream error: %s", e, exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        async for event in gen.tail():
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         sse_stream(),

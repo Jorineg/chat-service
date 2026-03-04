@@ -332,6 +332,13 @@ async def stream_chat_response(
                             ]
                             break  # fall through to tool execution below
 
+                    # Nudge: if no text was produced but tools ran, force a final text response
+                    has_tool_results = any(b.get("type") == "tool_call" for b in all_blocks)
+                    if not full_text and has_tool_results and iteration < settings.MAX_TOOL_ITERATIONS - 1:
+                        logger.info("Nudging model for final text response (no text after tool calls)")
+                        provider.append_assistant_turn(api_messages, turn_text, [])
+                        continue
+
                     total_usage["model"] = active_model
                     yield {
                         "type": "done",
@@ -384,7 +391,30 @@ async def stream_chat_response(
 
         provider.append_tool_results(api_messages, tool_results)
 
-    yield {"type": "error", "message": f"Too many tool iterations (max {settings.MAX_TOOL_ITERATIONS})"}
+    # Max iterations reached — do one final call without tools to force a text summary
+    logger.info("Max tool iterations reached, forcing final response without tools")
+    try:
+        async for event in provider.stream_turn(
+            api_messages, system, [], active_model, max_tokens, None
+        ):
+            if event["type"] == "text":
+                full_text += event["content"]
+                _append_block("text", event["content"])
+                yield {"type": "text", "content": event["content"]}
+            elif event["type"] == "turn_end":
+                usage = event.get("usage", {})
+                for k in total_usage:
+                    total_usage[k] += usage.get(k, 0)
+    except Exception as e:
+        logger.warning("Final nudge failed: %s", e)
+
+    total_usage["model"] = active_model
+    yield {
+        "type": "done",
+        "content": full_text,
+        "blocks": all_blocks if all_blocks else None,
+        "metadata": total_usage,
+    }
 
 # ---------------------------------------------------------------------------
 # Title generation
@@ -393,7 +423,7 @@ async def stream_chat_response(
 
 async def generate_title(content: str, pool: asyncpg.Pool) -> str:
     """Generate a short title for a chat session from the first message."""
-    prompt = f"Give this question a short title (max 5 words, no period, no quotes):\n\n{content[:500]}"
+    prompt = f"Generate a short title (2-5 words) for this chat message. Reply with ONLY the title — no alternatives, no explanations, no quotes, no period.\n\n{content[:500]}"
 
     try:
         title_model_id = settings.TITLE_MODEL
