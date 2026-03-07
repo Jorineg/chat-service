@@ -210,6 +210,16 @@ class SandboxSession:
             except Exception as e:
                 return {"type": "download_file_result", "error": str(e)}
 
+        if msg_type == "download_craft_file":
+            future = asyncio.run_coroutine_threadsafe(
+                self._download_craft_file(msg["storage_path"]), loop
+            )
+            try:
+                local_path = future.result(timeout=30)
+                return {"type": "download_craft_file_result", "local_path": local_path}
+            except Exception as e:
+                return {"type": "download_craft_file_result", "error": str(e)}
+
         if msg_type == "download_url":
             future = asyncio.run_coroutine_threadsafe(self._get_download_url(msg["id"]), loop)
             try:
@@ -435,6 +445,31 @@ class SandboxSession:
             f.write(data)
 
         # Return path as seen from inside the container
+        return f"/work/{Path(local_path).name}"
+
+    async def _download_craft_file(self, storage_path: str) -> str:
+        """Download a file from the craft-files bucket into /work/."""
+        MAX = 100 * 1024 * 1024
+        data = await storage.download_file("craft-files", storage_path)
+        if not data:
+            raise RuntimeError(f"Failed to download craft file: {storage_path}")
+        if len(data) > MAX:
+            raise RuntimeError(f"File too large: {len(data)} bytes (limit {MAX})")
+
+        filename = Path(storage_path).name
+        # Strip block_id prefix if present (format: {block_id}_{filename})
+        if "_" in filename and len(filename.split("_", 1)[0]) > 30:
+            filename = filename.split("_", 1)[1]
+
+        work_dir = os.path.join(self._shared_dir, "work")
+        local_path = os.path.join(work_dir, filename)
+        if os.path.exists(local_path):
+            name, ext = os.path.splitext(filename)
+            local_path = os.path.join(work_dir, f"{name}_{storage_path.split('/')[0][:8]}{ext}")
+
+        with open(local_path, "wb") as f:
+            f.write(data)
+
         return f"/work/{Path(local_path).name}"
 
     async def _describe_image(self, ref: str, question: str | None, page: int | None) -> str:

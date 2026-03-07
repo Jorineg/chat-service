@@ -45,6 +45,10 @@ class AgentResult:
 # ---------------------------------------------------------------------------
 
 _TIER_CONTEXT = """\
+You are an automated background agent running without a human operator. \
+No one reads your text output — only your tool calls matter. \
+Do not narrate, explain, or ask questions. Just execute the task using `run_python` tool calls.
+
 ## Project Activity System — Overview
 
 IBHelm manages 15+ active building engineering projects (TGA/HVAC) across clients. Project knowledge is scattered across Teamwork tasks, Missive emails, Craft docs, \
@@ -128,6 +132,11 @@ You have one tool: `run_python`. It executes Python code in an isolated containe
 **Pre-loaded functions (no import needed):**
 - `db(sql)` — execute read-only SQL (SELECT/WITH). Returns list[dict].
 - `fmt(rows)` — format rows as compact table for inspection.
+- `file_text(id_or_path)` — extract text from a file (PDF, docx, pptx, xlsx, csv, txt). Accepts file UUID or /work/ path.
+- `file_image(id_or_path, page=None, max_dim=None)` — queue an image for you to see. For PDFs pass page number. max_dim resizes longest edge. Accepts file UUID or /work/ path.
+- `describe_image(id_or_path, question=None, page=None)` — send image to a vision model, get text description back. Pass a specific question for targeted analysis. Accepts file UUID or /work/ path.
+- `download_file(content_hash)` — download a NAS file into /work/ by content_hash. Returns local path.
+- `download_craft_file(storage_path)` — download a Craft doc media file (image, PDF, etc.) into /work/. The storage_path is the part after `craft-files/` in the URL. Returns local path.
 - `add_activity_entry(project_id, logged_at, category, summary, source_event_ids=[], kgr_codes=[], involved_persons=[])` — insert a Tier 3 entry. Returns the new entry's UUID on success.
 - `update_project_status(project_id, markdown)` — replace Tier 2 status. Returns confirmation with char count. Rejected if new text is less than half the length of current (to prevent accidental truncation).
 - `update_project_profile(project_id, markdown)` — replace Tier 1 profile. Same length protection as status.
@@ -143,6 +152,20 @@ add_activity_entry(
     kgr_codes=["KGR 434"],
 )
 ```
+
+## Inspecting files for better context
+
+When events reference Craft documents, email attachments, or NAS files that contain images, PDFs, or other media, \
+you may download and inspect them to understand what actually happened — especially when the text metadata alone \
+is insufficient. This often produces much better, more specific summaries.
+
+- **Craft doc media**: URLs in Craft markdown like `.../craft-files/DOC_ID/BLOCK_ID_filename.pdf` — use \
+`download_craft_file("DOC_ID/BLOCK_ID_filename.pdf")` to pull into /work/.
+- **NAS files**: Use `download_file(content_hash)` with the hash from `file_contents` table.
+- **Email attachments**: Query `email_attachment_files` → `file_contents` to get the content_hash, then `download_file()`.
+
+Once a file is in /work/, use `file_image(path)` to view images, `file_text(path)` to extract text from PDFs/docs, \
+or `describe_image(path, question)` for vision analysis.
 
 ## Important rules
 
@@ -500,7 +523,7 @@ async def _run_bootstrap_agent(pool: asyncpg.Pool, project_id: int, request_id: 
         "SELECT name FROM teamwork.projects WHERE id = $1", project_id
     )
 
-    user_message = f"# Bootstrap project: {project_name or 'Unknown'} (ID: {project_id})\n\nGenerate Tier 1 (profile) and Tier 2 (status) from scratch for this project."
+    user_message = f"[system] # Bootstrap project: {project_name or 'Unknown'} (ID: {project_id})\n\nGenerate Tier 1 (profile) and Tier 2 (status) from scratch for this project."
 
     async def _bootstrap_nudge(p: asyncpg.Pool) -> str | None:
         row = await p.fetchrow(
@@ -518,7 +541,7 @@ async def _run_bootstrap_agent(pool: asyncpg.Pool, project_id: int, request_id: 
             return None
         logger.info("Nudging bootstrap for project %s — missing: %s", project_id, ", ".join(missing))
         return (
-            f"You have not saved your results yet. Still missing: {', '.join(missing)}.\n\n"
+            f"[system] You have not saved your results yet. Still missing: {', '.join(missing)}.\n\n"
             f"Continue your research if needed, then call the write functions to save "
             f"Tier 1 profile and Tier 2 status for project {project_id}."
         )
@@ -549,7 +572,7 @@ def _build_event_prompt(
     current_t2: str | None,
     recent_t3: list,
 ) -> str:
-    parts = [f"# Project: {project_name or 'Unknown'} (ID: {project_id})", ""]
+    parts = [f"[system] # Project: {project_name or 'Unknown'} (ID: {project_id})", ""]
 
     if current_t1:
         parts.extend(["## Current Tier 1 (Profile)", current_t1, ""])

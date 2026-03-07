@@ -129,12 +129,19 @@ def _build_env(bridge: BridgeClient) -> dict:
         pending_images.append({"ref": str(ref), "page": page, "max_dim": max_dim})
         print(f"[Image queued: {ref}]")
 
-    def file_text(file_id=None, **kwargs) -> str:
+    def file_text(file_id_or_path=None, **kwargs) -> str:
         """Extract text from a file. Works for PDF, docx, pptx, xlsx, csv, plain text."""
-        file_id = file_id or kwargs.get("id") or kwargs.get("id_or_path")
-        if not file_id:
-            raise ValueError("file_text requires a file ID as first argument")
-        info = bridge.file_info(file_id)
+        ref = file_id_or_path or kwargs.get("id") or kwargs.get("id_or_path") or kwargs.get("path")
+        if not ref:
+            raise ValueError("file_text requires a file ID or /work/ path as first argument")
+
+        if "/" in str(ref):
+            local_path = Path(str(ref))
+            if not local_path.exists():
+                raise FileNotFoundError(f"File not found: {ref}")
+            return _extract_text(local_path, "")
+
+        info = bridge.file_info(ref)
         filename = info.get("filename", "")
         mime = info.get("mime_type", "")
 
@@ -159,6 +166,7 @@ def _build_env(bridge: BridgeClient) -> dict:
         "file_image": file_image,
         "describe_image": bridge.describe_image,
         "download_file": bridge.download_file,
+        "download_craft_file": bridge.download_craft_file,
         "download_url": bridge.download_url,
         "add_activity_entry": bridge.add_activity_entry,
         "update_project_status": bridge.update_project_status,

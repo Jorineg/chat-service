@@ -72,6 +72,14 @@ class BridgeClient:
             raise RuntimeError(resp["error"])
         return resp["local_path"]
 
+    def download_craft_file(self, storage_path=None, **kwargs) -> str:
+        """Download a Craft doc media file into /work/. Returns local path."""
+        storage_path = storage_path or kwargs.get("path") or kwargs.get("key")
+        resp = self._request("download_craft_file", {"storage_path": storage_path})
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp["local_path"]
+
     def download_url(self, file_id=None, **kwargs) -> str:
         file_id = file_id or kwargs.get("id") or kwargs.get("id_or_path")
         resp = self._request("download_url", {"id": file_id})

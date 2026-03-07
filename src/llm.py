@@ -50,10 +50,11 @@ TOOL_DESCRIPTION = (
     "- db(sql) -> list[dict]: Execute read-only SQL (SELECT/WITH)\n"
     "- fmt(rows, max_rows=50, max_cell=80) -> str: Format as compact TOON table\n"
     "- file_info(id) -> dict: File metadata {filename, size, mime_type, nas_path, project_name, extracted_text}\n"
-    "- file_text(id) -> str: Extract text (PDF, docx, pptx, xlsx, csv, txt)\n"
+    "- file_text(id_or_path) -> str: Extract text (PDF, docx, pptx, xlsx, csv, txt). Accepts file UUID or /work/ path.\n"
     "- file_image(id_or_path, page=None, max_dim=None): Queue image for you to see (vision models only). For PDFs: page number. max_dim resizes.\n"
     "- describe_image(id_or_path, question=None, page=None): Send image to a vision model, get text description back. Use when you cannot view images directly. Pass a specific question for targeted analysis.\n"
     "- download_file(content_hash) -> str: Download NAS file into /work/ by content_hash from DB\n"
+    "- download_craft_file(storage_path) -> str: Download Craft doc media (image/PDF/file) into /work/ by its storage path from craft-files bucket\n"
     "- download_url(file_id) -> str: Get URL for user to click\n\n"
     "Full Python: import anything, subprocess, os, open() all work.\n"
     "/work/ is your workspace with conversation files pre-populated.\n"
@@ -106,10 +107,11 @@ You have one tool: `run_python`. Execute Python code in an isolated container wi
 - `db(sql)` - Execute read-only SQL (SELECT/WITH only). Returns list[dict].
 - `fmt(rows, max_rows=50, max_cell=80)` - Format rows as compact TOON table.
 - `file_info(id)` - Get metadata for a conversation file: {filename, size_bytes, mime_type, nas_path, project_name, extracted_text}.
-- `file_text(id)` - Extract text from a file (PDF, docx, pptx, xlsx, csv, plain text). Returns string.
+- `file_text(id_or_path)` - Extract text from a file (PDF, docx, pptx, xlsx, csv, plain text). Returns string. Accepts file UUID or /work/ path.
 - `file_image(id_or_path, page=None, max_dim=None)` - Queue an image for you to see (vision models only). For PDFs pass page number (1-indexed). max_dim resizes longest edge to save tokens. Accepts file UUID or local path.
 - `describe_image(id_or_path, question=None, page=None)` - Send image to a vision model and get a text description back. Use this if you cannot view images directly. Pass a specific question for targeted analysis (e.g. "what text is on this document?"), or None for a general description. Accepts file UUID or local /work/ path.
 - `download_file(content_hash)` - Download a NAS file into /work/ by its content_hash (from file_contents table). Returns local path.
+- `download_craft_file(storage_path)` - Download a Craft document media file (image, PDF, etc.) into /work/ by its storage path from the craft-files bucket. The storage path is the part after `craft-files/` in the URL. Returns local path.
 - `download_url(file_id)` - Get a download URL for a file the user can click.
 
 ### Environment
