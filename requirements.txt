@@ -5,4 +5,10 @@ anthropic
 openai
 PyJWT
 python-dotenv
+python-multipart
 logtail-python
+docker
+httpx
+Pillow
+pillow-heif
+PyMuPDF

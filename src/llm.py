@@ -3,15 +3,22 @@
 import json
 import logging
 import re
+from pathlib import Path
 from typing import AsyncGenerator
 
 import asyncpg
 
 from . import settings
-from .sandbox import execute_python, create_sandbox_env
+from .sandbox import SandboxSession, resolve_images
+from . import storage as st
 from .providers import get_provider
 
 logger = logging.getLogger("ibhelm.chat.llm")
+
+# Auto-generated schema doc and sandbox requirements (loaded once at import)
+_DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
+_SCHEMA_DOC = (_DOCS_DIR / "schema_doc_output.md").read_text().strip() if (_DOCS_DIR / "schema_doc_output.md").exists() else ""
+_SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").read_text().strip() if (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").exists() else ""
 
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
@@ -38,9 +45,19 @@ def _extract_code_blocks(text: str) -> list[str]:
 
 TOOL_NAME = "run_python"
 TOOL_DESCRIPTION = (
-    "Execute Python code with database access.\n\n"
-    "Available: db(sql) → list[dict], fmt(rows) → str (TOON format), "
-    "math, json, re, datetime, timedelta, date, Counter, defaultdict.\n\n"
+    "Execute Python in an isolated container with full library access.\n\n"
+    "Pre-loaded functions (no import needed):\n"
+    "- db(sql) -> list[dict]: Execute read-only SQL (SELECT/WITH)\n"
+    "- fmt(rows, max_rows=50, max_cell=80) -> str: Format as compact TOON table\n"
+    "- file_info(id) -> dict: File metadata {filename, size, mime_type, nas_path, project_name, extracted_text}\n"
+    "- file_text(id) -> str: Extract text (PDF, docx, pptx, xlsx, csv, txt)\n"
+    "- file_image(id_or_path, page=None, max_dim=None): Queue image for you to see (vision models only). For PDFs: page number. max_dim resizes.\n"
+    "- describe_image(id_or_path, question=None, page=None): Send image to a vision model, get text description back. Use when you cannot view images directly. Pass a specific question for targeted analysis.\n"
+    "- download_file(content_hash) -> str: Download NAS file into /work/ by content_hash from DB\n"
+    "- download_url(file_id) -> str: Get URL for user to click\n\n"
+    "Full Python: import anything, subprocess, os, open() all work.\n"
+    "/work/ is your workspace with conversation files pre-populated.\n"
+    "New files created in /work/ are automatically saved.\n"
     "Variables persist across tool calls within this response."
 )
 TOOL_INPUT_SCHEMA = {
@@ -77,15 +94,37 @@ Plus local files synced from the office NAS.
 - Keep responses focused and actionable. Avoid unnecessary pleasantries.
 - Variables persist across tool calls within one response - reuse them for multi-step analysis.
 
+## Previous conversations
+- while every new conversation starts with a fresh context, you have access to the previous conversations and can use them to understand the current context and the user's intent.
+- use this tool wisely if you think the user might be refrencing something from previous conversations or it could be helpful to look them up
+- use db function: search_chat_history for this purpose
+
 ## Tool: run_python
-You have one tool: `run_python`. Write Python code using the available functions and modules.
+You have one tool: `run_python`. Execute Python code in an isolated container with full library access.
 
-### Functions
-- `db(sql)` - Execute read-only SQL (SELECT/WITH only). Returns list of dicts. Keys are column names.
-- `fmt(rows, max_rows=50, max_cell=80)` - Format rows as compact TOON table. Set max_rows=None or max_cell=None to disable truncation.
+### Pre-loaded Functions (always available, no import needed)
+- `db(sql)` - Execute read-only SQL (SELECT/WITH only). Returns list[dict].
+- `fmt(rows, max_rows=50, max_cell=80)` - Format rows as compact TOON table.
+- `file_info(id)` - Get metadata for a conversation file: {filename, size_bytes, mime_type, nas_path, project_name, extracted_text}.
+- `file_text(id)` - Extract text from a file (PDF, docx, pptx, xlsx, csv, plain text). Returns string.
+- `file_image(id_or_path, page=None, max_dim=None)` - Queue an image for you to see (vision models only). For PDFs pass page number (1-indexed). max_dim resizes longest edge to save tokens. Accepts file UUID or local path.
+- `describe_image(id_or_path, question=None, page=None)` - Send image to a vision model and get a text description back. Use this if you cannot view images directly. Pass a specific question for targeted analysis (e.g. "what text is on this document?"), or None for a general description. Accepts file UUID or local /work/ path.
+- `download_file(content_hash)` - Download a NAS file into /work/ by its content_hash (from file_contents table). Returns local path.
+- `download_url(file_id)` - Get a download URL for a file the user can click.
 
-### Modules (all pre-loaded — NEVER use import/from statements, they will error)
-math, json, re, datetime, timedelta, date, Counter, defaultdict
+### Environment
+- Full Python with all standard libraries. `import` works normally.
+- Available packages: """ + _SANDBOX_REQUIREMENTS.replace('\n', ', ') + """.
+- `subprocess`, `os`, `pathlib`, `open()` all work.
+- /opt/sandbox/docs/ contains reference documentation. Read files there when you need details about the dashboard UI, system architecture, or deployment.
+- /work/ is your workspace. Files the user attached to the conversation are pre-populated there.
+- Any new files you save to /work/ are automatically uploaded and available to the user after execution.
+- Variables persist across tool calls within this response.
+
+### File IDs
+- Files attached to messages have UUIDs (use with file_info, file_text, file_image, download_url).
+- NAS files found via SQL have a `content_hash` in the `file_contents` table (use with download_file to pull into /work/).
+- The `files` table has: id, full_path, content_hash, project_id. Join with `file_contents` for size, mime_type, extracted_text.
 
 ### Example
 ```python
@@ -104,61 +143,7 @@ print(fmt(tasks))
 ```
 
 ## Database Schema
-
-### teamwork (project management)
-- **projects**: id, name, description, status, company_id, start_date, end_date, created_at, updated_at
-- **tasks**: id, project_id, tasklist_id, name, description, status ('new'/'in progress'/'completed'), priority ('low'/'medium'/'high'), progress (0-100), parent_task, start_date, due_date, estimate_minutes, accumulated_estimated_minutes, created_at
-- **tasklists**: id, name, description, project_id, status
-- **users**: id, first_name, last_name, email, title, company_id, is_admin
-- **companies**: id, name, email_one, phone, website, address_one, city, zip
-- **tags**: id, name, color, project_id
-- **timelogs**: id, task_id, project_id, user_id, minutes, description, time_logged, is_billable
-- Junction: **task_tags**(task_id, tag_id), **task_assignees**(task_id, user_id), **user_teams**(user_id, team_id)
-
-### missive (email)
-- **conversations**: id, subject, latest_message_subject, messages_count, last_activity_at, web_url, app_url
-- **messages**: id, conversation_id, subject, preview, body, body_plain_text, from_contact_id, delivered_at, created_at
-- **contacts**: id, name, email
-- **attachments**: id, message_id, filename, extension, size, media_type
-- **shared_labels**: id, name
-- Junction: **conversation_labels**(label_id, conversation_id), **message_recipients**(message_id, recipient_type, contact_id)
-
-### public (core)
-- **files**: id, full_path, content_hash, project_id, document_type_id, fs_mtime, deleted_at
-- **file_contents**: content_hash, size_bytes, mime_type, extracted_text, thumbnail_path
-- **craft_documents**: id, title, markdown_content, folder_path, craft_last_modified_at, daily_note_date
-- **unified_persons**: id, display_name, primary_email, is_internal, is_company
-- **locations**: id, parent_id, name, type (building/level/room), path, depth
-- **cost_groups**: id, parent_id, code, name, path (DIN 276 Kostengruppen, 3-digit codes 100-999)
-- **project_extensions**: tw_project_id, default_location_id, default_cost_group_id, nas_folder_path, client_person_id
-- **task_types**: id, name, slug, color, icon
-- **task_extensions**: tw_task_id, task_type_id
-
-### Key Views (query like tables)
-- **project_overview**: id, name, status, company_name, client_name, file_count, task_count, conversation_count
-- **unified_items_secure**: Unified view across tasks, emails, files, and Craft docs
-  - type: 'task' | 'email' | 'file' | 'craft'
-  - Columns: id, type, name, status, project, project_status, customer, due_date, created_at, updated_at, creator, search_text, teamwork_url, missive_url, craft_url, assigned_to (jsonb), tags (jsonb), location, location_path, cost_group, cost_group_code, priority, progress, tasklist, body, preview, conversation_subject, recipients (jsonb), attachments (jsonb), attachment_count
-  - Emails are filtered by current user's visibility (RLS)
-  - Use ILIKE on search_text for full-text search
-  - For newest emails: `WHERE type = 'email' ORDER BY created_at DESC`
-  - For tasks: `WHERE type = 'task'`
-- **file_details**: id, full_path, content_hash, document_type, thumbnail_path, project (jsonb), size_bytes
-- **unified_person_details**: id, display_name, primary_email, tw_user_email, m_contact_email, is_internal, is_company
-- **location_hierarchy**: id, name, type, depth, path, parent_name, building_name, child_count
-
-### Key Relationships
-- task → project: tasks.project_id → projects.id
-- task → assignees: task_assignees (task_id, user_id)
-- task → tags: task_tags (task_id, tag_id)
-- conversation → labels: conversation_labels (label_id, conversation_id)
-- message → sender: messages.from_contact_id → contacts.id
-- message → recipients: message_recipients (message_id, recipient_type [to/cc/bcc], contact_id)
-- file → project: files.project_id → projects.id
-- object → location: object_locations (tw_task_id | m_conversation_id | file_id, location_id)
-- object → cost_group: object_cost_groups (tw_task_id | m_conversation_id | file_id, cost_group_id)
-- project → conversations: project_conversations (m_conversation_id, tw_project_id)
-- project → craft docs: project_craft_documents (craft_document_id, tw_project_id)
+""" + _SCHEMA_DOC + """
 
 ## Generating Links
 When you mention specific tasks, emails, projects, or documents, always include clickable Markdown links.
@@ -179,7 +164,7 @@ has access to. This is normal — do not treat missing results as an error.
 - If the user wants to edit something, they must do it in the source tool (Teamwork, Missive, Craft). Changes sync to the database within a few minutes.
 - You cannot send notifications, schedule tasks, or access external websites.
 - Long print output is automatically truncated. If that happens, use targeted slicing on your variables to inspect specific parts.
-- The `import` statement is disabled in the sandbox. All modules and functions are pre-loaded. Never write `import` or `from ... import`."""
+- The sandbox has no internet access. All external data must come through db() or pre-populated files."""
 
 # ---------------------------------------------------------------------------
 # Model config resolution (cached from DB)
@@ -247,7 +232,10 @@ async def stream_chat_response(
     messages: list[dict],
     pool: asyncpg.Pool,
     user_email: str | None = None,
-    model_override: str | None = None,
+    model_config: dict | None = None,
+    sandbox: SandboxSession | None = None,
+    assistant_msg_id: str | None = None,
+    system_prompt: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Stream a chat response with tool calling loop.
 
@@ -259,15 +247,23 @@ async def stream_chat_response(
       {"type": "done", "content": "...", "blocks": [...], "metadata": {...}}
       {"type": "error", "message": "..."}
     """
-    model_config = await resolve_model(model_override, pool)
+    if not model_config:
+        model_config = await resolve_model(None, pool)
     provider = get_provider(model_config)
     active_model = model_config["id"]
 
-    dynamic_context = await _build_dynamic_context(pool, user_email)
-    static = STATIC_SYSTEM_PROMPT
-    if model_config.get("system_prompt_addition"):
-        static += "\n\n" + model_config["system_prompt_addition"]
-    system = provider.build_system_prompt(static, dynamic_context)
+    yield {"type": "model_resolved", "model": active_model}
+
+    if system_prompt:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        system = provider.build_system_prompt(system_prompt, f"Current time: {ts}")
+    else:
+        dynamic_context = await _build_dynamic_context(pool, user_email)
+        static = STATIC_SYSTEM_PROMPT
+        if model_config.get("system_prompt_addition"):
+            static += "\n\n" + model_config["system_prompt_addition"]
+        system = provider.build_system_prompt(static, dynamic_context)
     tools = [provider.build_tool_definition(TOOL_NAME, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA)]
     api_messages = provider.build_api_messages(messages)
 
@@ -276,7 +272,6 @@ async def stream_chat_response(
         thinking_config = {"budget_tokens": settings.THINKING_BUDGET}
 
     max_tokens = 16384 if thinking_config else 8192
-    sandbox_env = create_sandbox_env()
     all_blocks: list[dict] = []
     full_text = ""
 
@@ -359,7 +354,7 @@ async def stream_chat_response(
 
         provider.append_assistant_turn(api_messages, turn_text, turn_tool_calls)
 
-        # Execute each tool call
+        # Execute each tool call via sandbox container
         tool_results = []
         for tc in turn_tool_calls:
             code = tc["input"].get("code", "")
@@ -367,26 +362,61 @@ async def stream_chat_response(
 
             yield {"type": "tool_call", "id": tc_id, "code": code}
 
-            result = await execute_python(code, pool, user_email, sandbox_env)
+            if sandbox:
+                result = await sandbox.execute(code)
+            else:
+                result = {"stdout": None, "result": None, "error": "Sandbox not available",
+                          "pending_images": [], "new_files": []}
+
             tc_record: dict = {"type": "tool_call", "id": tc_id, "code": code}
 
             if result.get("error"):
                 output = result["error"]
-                if result.get("output"):
-                    output = result["output"] + "\n" + output
+                if result.get("stdout"):
+                    output = result["stdout"] + "\n" + output
                 tc_record["error"] = output
                 yield {"type": "tool_result", "id": tc_id, "error": output}
             else:
                 parts = []
-                if result.get("output"):
-                    parts.append(result["output"])
+                if result.get("stdout"):
+                    parts.append(result["stdout"])
                 if result.get("result") is not None:
                     parts.append(json.dumps(result["result"], ensure_ascii=False, default=str))
                 output = "\n".join(parts) if parts else "(no output)"
                 tc_record["result"] = output
                 yield {"type": "tool_result", "id": tc_id, "result": output}
 
-            tool_results.append({"tool_use_id": tc_id, "content": output})
+            # Upload new files from sandbox and append info to output
+            if result.get("new_files") and sandbox and assistant_msg_id:
+                created = await sandbox.upload_new_files(result["new_files"], assistant_msg_id)
+                if created:
+                    yield {"type": "files_created", "files": created}
+                    file_lines = ["\n\n[Files saved]"]
+                    for cf in created:
+                        url = st.public_url("chat-files", cf["content_hash"])
+                        file_lines.append(f"- {cf['filename']}: id={cf['id']}, url={url}")
+                    output += "\n".join(file_lines)
+                    tc_record["result"] = output
+
+            tool_content = output
+            if result.get("pending_images") and sandbox:
+                if model_config.get("supports_vision"):
+                    images = await resolve_images(sandbox, result["pending_images"])
+                    if images:
+                        tool_content = [{"type": "text", "text": output}] + images
+                        yield {"type": "pending_images", "images": result["pending_images"]}
+                else:
+                    vision_hint = (
+                        "\n\nERROR: This model cannot view images directly. "
+                        "Use describe_image(id_or_path, question=None) instead — "
+                        "it sends the image to a vision model and returns a text description. "
+                        "Pass a specific question for targeted analysis, or None for a general description."
+                    )
+                    output += vision_hint
+                    tc_record["result"] = output
+                    tool_content = output
+
+            tool_results.append({"tool_use_id": tc_id, "content": tool_content})
             all_blocks.append(tc_record)
 
         provider.append_tool_results(api_messages, tool_results)

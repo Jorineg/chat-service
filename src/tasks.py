@@ -4,6 +4,7 @@ Each active generation is an asyncio.Task that:
 - Runs the tool loop independently of any SSE connection
 - Pushes events to a list (supports multiple readers / reconnection)
 - Writes to DB incrementally after each tool result
+- Manages sandbox container lifecycle (per response)
 - Cleans up on completion or error
 """
 
@@ -13,6 +14,8 @@ import logging
 from dataclasses import dataclass, field
 
 import asyncpg
+
+from .sandbox import SandboxSession, get_session_files
 
 logger = logging.getLogger("ibhelm.chat.tasks")
 
@@ -50,7 +53,6 @@ class GenerationTask:
                 pass
 
 
-# Session-level registry (one active generation per session)
 _active: dict[str, GenerationTask] = {}
 
 
@@ -75,18 +77,49 @@ async def run_generation(
     history: list[dict],
     pool: asyncpg.Pool,
     user_email: str | None,
-    model_id: str | None,
+    model_config: dict,
     user_content: str,
     session_title: str | None,
+    user_id: str | None = None,
 ):
     """Run LLM generation as an independent task. Pushes events + writes to DB incrementally."""
     from .llm import stream_chat_response, generate_title
 
     all_blocks: list[dict] = []
     full_text = ""
-    final_metadata: dict | None = None
+    active_model: str = model_config["id"]
+    sandbox: SandboxSession | None = None
 
-    # Fire title generation in parallel — pushes event as soon as ready
+    async def _finalize(status: str, error: str | None = None, usage: dict | None = None):
+        """Single exit point: push 'done' event + write same state to DB."""
+        metadata = {"model": active_model, **(usage or {})}
+        done_event: dict = {
+            "type": "done", "status": status,
+            "content": full_text, "blocks": all_blocks or None,
+            "metadata": metadata,
+        }
+        if error:
+            done_event["error"] = error
+        gen.push(done_event)
+        try:
+            await pool.execute(
+                """UPDATE chat_messages
+                   SET content = $1, blocks = $2, metadata = $3, status = $4
+                   WHERE id = $5""",
+                full_text or None,
+                json.dumps(all_blocks, ensure_ascii=False) if all_blocks else None,
+                json.dumps(metadata, ensure_ascii=False),
+                status,
+                gen.assistant_msg_id,
+            )
+            if status == "complete":
+                await pool.execute(
+                    "UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1",
+                    gen.session_id,
+                )
+        except Exception as e:
+            logger.error("Failed to write final state to DB: %s", e)
+
     if not session_title:
         async def _gen_title():
             try:
@@ -101,13 +134,27 @@ async def run_generation(
         asyncio.create_task(_gen_title())
 
     try:
-        async for event in stream_chat_response(history, pool, user_email, model_id):
-            gen.push(event)
+        sandbox = SandboxSession(pool, user_email, gen.session_id, user_id=user_id)
+        conversation_files = await get_session_files(pool, gen.session_id)
+        await sandbox.start(conversation_files)
+
+        async for event in stream_chat_response(history, pool, user_email, model_config, sandbox, gen.assistant_msg_id):
             etype = event["type"]
+
+            # done/error are handled exclusively by _finalize — don't push raw
+            if etype == "done":
+                usage = event.get("metadata") or {}
+                usage.pop("model", None)
+                await _finalize("complete", usage=usage)
+                continue
+            if etype == "error":
+                await _finalize("error", error=event.get("message"))
+                continue
+
+            gen.push(event)
 
             if etype == "tool_result":
                 tc_record = {"type": "tool_call", "id": event["id"], "code": ""}
-                # Find code from previous tool_call event
                 for prev in reversed(gen.events):
                     if prev.get("type") == "tool_call" and prev.get("id") == event["id"]:
                         tc_record["code"] = prev.get("code", "")
@@ -118,7 +165,6 @@ async def run_generation(
                     tc_record["error"] = event["error"]
                 all_blocks.append(tc_record)
 
-                # Incremental DB write after each tool result
                 await pool.execute(
                     "UPDATE chat_messages SET blocks = $1 WHERE id = $2",
                     json.dumps(all_blocks, ensure_ascii=False),
@@ -138,63 +184,22 @@ async def run_generation(
                 else:
                     all_blocks[-1]["text"] += event["content"]
 
-            elif etype == "done":
-                final_metadata = event.get("metadata")
-                final_blocks = event.get("blocks") or all_blocks or None
-                await pool.execute(
-                    """UPDATE chat_messages
-                       SET content = $1, blocks = $2, metadata = $3, status = 'complete'
-                       WHERE id = $4""",
-                    full_text,
-                    json.dumps(final_blocks, ensure_ascii=False) if final_blocks else None,
-                    json.dumps(final_metadata, ensure_ascii=False) if final_metadata else None,
-                    gen.assistant_msg_id,
-                )
-                await pool.execute(
-                    "UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1",
-                    gen.session_id,
-                )
-
-            elif etype == "error":
-                # Save partial work on error
-                await pool.execute(
-                    """UPDATE chat_messages
-                       SET content = $1, blocks = $2, status = 'error'
-                       WHERE id = $3""",
-                    full_text or None,
-                    json.dumps(all_blocks, ensure_ascii=False) if all_blocks else None,
-                    gen.assistant_msg_id,
-                )
-
-        # Handle max tool iterations (stream ends without done event)
+        # Safety net: stream ended without done/error
         row = await pool.fetchrow(
             "SELECT status FROM chat_messages WHERE id = $1", gen.assistant_msg_id
         )
         if row and row["status"] == "generating":
-            await pool.execute(
-                """UPDATE chat_messages
-                   SET content = $1, blocks = $2, status = 'error'
-                   WHERE id = $3""",
-                full_text or None,
-                json.dumps(all_blocks, ensure_ascii=False) if all_blocks else None,
-                gen.assistant_msg_id,
-            )
+            await _finalize("error", error="Generation ended unexpectedly")
 
+    except asyncio.CancelledError:
+        logger.info("Generation cancelled for session %s", gen.session_id)
+        await _finalize("canceled")
     except Exception as e:
         logger.error("Generation task failed: %s", e, exc_info=True)
-        gen.push({"type": "error", "message": str(e)})
-        try:
-            await pool.execute(
-                """UPDATE chat_messages
-                   SET content = $1, blocks = $2, status = 'error'
-                   WHERE id = $3""",
-                full_text or None,
-                json.dumps(all_blocks, ensure_ascii=False) if all_blocks else None,
-                gen.assistant_msg_id,
-            )
-        except Exception:
-            pass
+        await _finalize("error", error=str(e))
     finally:
+        if sandbox:
+            await sandbox.cleanup()
         gen.finish()
         unregister(gen.session_id)
         logger.info("Generation task finished for session %s", gen.session_id)

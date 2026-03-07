@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator
 
 from openai import AsyncOpenAI, APIError
 
-from .base import LLMProvider, inject_timestamp, truncate_tool_output
+from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
 
 logger = logging.getLogger("ibhelm.chat.provider.openai_compat")
 
@@ -42,6 +42,21 @@ def _parse_leaked_tool_calls(reasoning: str) -> list[dict]:
     return results
 
 
+def _rewrite_hallucinated_tool_call(tc: dict) -> dict:
+    """Convert a hallucinated direct function call into a run_python tool call.
+
+    Some models (e.g. GLM-4.7) call pre-loaded sandbox functions like file_image,
+    file_info, db, etc. as separate tools instead of wrapping them in run_python.
+    Uses positional args to avoid keyword name mismatches with actual function signatures.
+    """
+    name = tc["name"]
+    args = tc["input"]
+    positional = ", ".join(repr(v) for v in args.values())
+    code = f"print({name}({positional}))"
+    logger.info("Rewrote hallucinated tool call %s(%s) → run_python", name, ", ".join(args.keys()))
+    return {"id": tc["id"], "name": TOOL_NAME, "input": {"code": code}}
+
+
 class OpenAICompatProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -63,7 +78,8 @@ class OpenAICompatProvider(LLMProvider):
             blocks = msg.get("blocks")
 
             if role == "user":
-                api_msgs.append({"role": "user", "content": inject_timestamp(content, msg.get("created_at"))})
+                text = inject_file_context(content, msg.get("files") or [])
+                api_msgs.append({"role": "user", "content": inject_timestamp(text, msg.get("created_at"))})
                 continue
 
             if not blocks:
@@ -166,11 +182,24 @@ class OpenAICompatProvider(LLMProvider):
 
     def append_tool_results(self, messages: list[dict], results: list[dict]):
         for r in results:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": r["tool_use_id"],
-                "content": truncate_tool_output(r["content"]),
-            })
+            content = r["content"]
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if block["type"] == "text":
+                        parts.append({"type": "text", "text": truncate_tool_output(block["text"])})
+                    elif block["type"] == "image":
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{block['media_type']};base64,{block['base64']}"},
+                        })
+                messages.append({"role": "tool", "tool_call_id": r["tool_use_id"], "content": parts})
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": r["tool_use_id"],
+                    "content": truncate_tool_output(content),
+                })
 
     async def stream_turn(
         self,
@@ -257,7 +286,10 @@ class OpenAICompatProvider(LLMProvider):
                 parsed_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
             except json.JSONDecodeError:
                 parsed_input = {"code": tc["arguments"]}
-            tool_calls.append({"id": tc["id"], "name": tc["name"], "input": parsed_input})
+            entry = {"id": tc["id"], "name": tc["name"], "input": parsed_input}
+            if tc["name"] != TOOL_NAME:
+                entry = _rewrite_hallucinated_tool_call(entry)
+            tool_calls.append(entry)
 
         # Fallback: recover tool calls leaked into reasoning content
         if not tool_calls and finish_reason != "tool_calls" and reasoning_buffer:

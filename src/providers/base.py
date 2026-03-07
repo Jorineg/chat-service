@@ -52,6 +52,23 @@ def inject_timestamp(content: str, created_at: str | None = None) -> str:
     return f"{content}\n{ts}"
 
 
+def inject_file_context(content: str, files: list[dict]) -> str:
+    """Append attached file metadata to a user message so the LLM knows about them."""
+    if not files:
+        return content
+    lines = ["\n\n[Attached files — pre-populated in /work/]"]
+    for f in files:
+        size = f.get("size_bytes") or 0
+        if size < 1024:
+            size_str = f"{size} B"
+        elif size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        else:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        lines.append(f"- {f['filename']} (id: {f['id']}, {f.get('mime_type', '?')}, {size_str})")
+    return content + "\n".join(lines)
+
+
 class LLMProvider(ABC):
     """Abstract LLM provider. Subclasses handle Anthropic, OpenAI-compatible APIs, etc."""
 
@@ -75,7 +92,9 @@ class LLMProvider(ABC):
     def append_tool_results(self, messages: list[dict], results: list[dict]) -> None:
         """Append tool results to the API messages list.
 
-        results: [{tool_use_id: str, content: str}]
+        results: [{tool_use_id: str, content: str | list[dict]}]
+        Content can be a string (text only) or a list of content blocks
+        [{type:"text", text:str}, {type:"image", base64:str, media_type:str}].
         """
 
     @abstractmethod

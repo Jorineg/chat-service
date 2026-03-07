@@ -5,7 +5,7 @@ from typing import Any, AsyncGenerator
 
 import anthropic
 
-from .base import LLMProvider, inject_timestamp, truncate_tool_output
+from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
 
 logger = logging.getLogger("ibhelm.chat.provider.anthropic")
 
@@ -33,7 +33,8 @@ class AnthropicProvider(LLMProvider):
             blocks = msg.get("blocks")
 
             if role == "user":
-                api_msgs.append({"role": "user", "content": inject_timestamp(content, msg.get("created_at"))})
+                text = inject_file_context(content, msg.get("files") or [])
+                api_msgs.append({"role": "user", "content": inject_timestamp(text, msg.get("created_at"))})
                 continue
 
             if not blocks:
@@ -131,11 +132,26 @@ class AnthropicProvider(LLMProvider):
         messages.append({"role": "assistant", "content": content})
 
     def append_tool_results(self, messages: list[dict], results: list[dict]):
-        messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": r["tool_use_id"],
-             "content": truncate_tool_output(r["content"])}
-            for r in results
-        ]})
+        tool_results = []
+        for r in results:
+            content = r["content"]
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if block["type"] == "text":
+                        parts.append({"type": "text", "text": truncate_tool_output(block["text"])})
+                    elif block["type"] == "image":
+                        parts.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": block["media_type"],
+                                       "data": block["base64"]},
+                        })
+                tool_results.append({"type": "tool_result", "tool_use_id": r["tool_use_id"],
+                                     "content": parts})
+            else:
+                tool_results.append({"type": "tool_result", "tool_use_id": r["tool_use_id"],
+                                     "content": truncate_tool_output(content)})
+        messages.append({"role": "user", "content": tool_results})
 
     async def stream_turn(
         self,
