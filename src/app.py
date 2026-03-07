@@ -13,9 +13,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import settings, storage
-from .auth import get_current_user
+from .auth import get_current_user, require_admin
 from .database import get_pool, close_pool
-from .llm import get_model_configs, invalidate_model_cache, resolve_model
+from .llm import get_model_configs, invalidate_model_cache, resolve_model, build_session_prompt
+from .agent import AGENT_USER_ID
 from . import tasks
 
 logger = logging.getLogger("ibhelm.chat")
@@ -119,10 +120,11 @@ async def list_sessions(user: dict = Depends(get_current_user), q: Optional[str]
 async def create_session(body: SessionCreate, user: dict = Depends(get_current_user)):
     pool = await get_pool()
     user_id = user["sub"]
+    prompt = await build_session_prompt(pool, user.get("email"))
     row = await pool.fetchrow(
-        """INSERT INTO chat_sessions (user_id, title)
-           VALUES ($1, $2) RETURNING id, title, created_at, updated_at""",
-        user_id, body.title
+        """INSERT INTO chat_sessions (user_id, title, system_prompt)
+           VALUES ($1, $2, $3) RETURNING id, title, created_at, updated_at""",
+        user_id, body.title, prompt,
     )
     return {
         "id": str(row["id"]), "title": row["title"],
@@ -161,24 +163,14 @@ async def delete_session(session_id: str, user: dict = Depends(get_current_user)
 # Messages
 # =============================================================================
 
-@app.get("/sessions/{session_id}/messages")
-async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
-    pool = await get_pool()
-    user_id = user["sub"]
-    session = await pool.fetchrow(
-        "SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2",
-        session_id, user_id
-    )
-    if not session:
-        raise HTTPException(404, "Session not found")
-
+async def _fetch_session_messages(pool, session_id: str) -> list[dict]:
+    """Fetch messages + files for a session. Shared by user and admin endpoints."""
     rows = await pool.fetch(
         """SELECT id, role, content, blocks, metadata, status, created_at
            FROM chat_messages WHERE session_id = $1
            ORDER BY created_at ASC""",
         session_id
     )
-
     file_rows = await pool.fetch("""
         SELECT cf.id, cf.message_id, cf.filename, cf.content_hash, cf.bucket,
                cf.origin, cf.size_bytes, cf.mime_type
@@ -195,7 +187,6 @@ async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
             "origin": fr["origin"], "size_bytes": fr["size_bytes"],
             "mime_type": fr["mime_type"],
         })
-
     return [
         {"id": str(r["id"]), "role": r["role"], "content": r["content"],
          "blocks": json.loads(r["blocks"]) if r["blocks"] else None,
@@ -205,6 +196,18 @@ async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
          "files": files_by_msg.get(str(r["id"]), [])}
         for r in rows
     ]
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
+    pool = await get_pool()
+    session = await pool.fetchrow(
+        "SELECT id FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        session_id, user["sub"]
+    )
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return await _fetch_session_messages(pool, session_id)
 
 
 class MessageUpdate(BaseModel):
@@ -311,6 +314,7 @@ async def _cancel_active(session_id: str):
 async def _start_generation(
     pool, session_id: str, user_email: str | None, user_id: str,
     user_content: str, session_title: str | None, model_id: str | None,
+    system_prompt: str | None = None,
 ) -> tuple[str, tasks.GenerationTask]:
     """Shared generation setup. Call AFTER user message is ready in DB.
 
@@ -343,6 +347,7 @@ async def _start_generation(
     gen.task = asyncio.create_task(tasks.run_generation(
         gen, history, pool, user_email, model_config,
         user_content, session_title, user_id=user_id,
+        system_prompt=system_prompt,
     ))
     tasks.register(session_id, gen)
 
@@ -376,7 +381,7 @@ async def send_message(
     user_email = user.get("email")
 
     session = await pool.fetchrow(
-        "SELECT id, title FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        "SELECT id, title, system_prompt FROM chat_sessions WHERE id = $1 AND user_id = $2",
         session_id, user_id
     )
     if not session:
@@ -419,6 +424,7 @@ async def send_message(
     asst_msg_id, gen = await _start_generation(
         pool, session_id, user_email, str(user_id),
         content, session["title"], model,
+        system_prompt=session["system_prompt"],
     )
 
     initial = [{"type": "user_message_id", "id": user_msg_id}]
@@ -441,7 +447,7 @@ async def regenerate(session_id: str, body: RegenerateRequest, user: dict = Depe
     user_email = user.get("email")
 
     session = await pool.fetchrow(
-        "SELECT id, title FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        "SELECT id, title, system_prompt FROM chat_sessions WHERE id = $1 AND user_id = $2",
         session_id, user_id
     )
     if not session:
@@ -474,6 +480,7 @@ async def regenerate(session_id: str, body: RegenerateRequest, user: dict = Depe
     asst_msg_id, gen = await _start_generation(
         pool, session_id, user_email, str(user_id),
         user_msg["content"], session["title"], body.model,
+        system_prompt=session["system_prompt"],
     )
     return _sse_response({"type": "assistant_message_id", "id": asst_msg_id}, gen=gen)
 
@@ -619,6 +626,109 @@ async def list_files(session_id: str, user: dict = Depends(get_current_user)):
          "created_at": r["created_at"].isoformat()}
         for r in rows
     ]
+
+
+# =============================================================================
+# Agent Sessions (admin-only)
+# =============================================================================
+
+async def _verify_agent_session(pool, session_id: str):
+    """Verify session exists and belongs to the agent. Returns session row."""
+    row = await pool.fetchrow(
+        "SELECT id, title, system_prompt FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        session_id, AGENT_USER_ID,
+    )
+    if not row:
+        raise HTTPException(404, "Agent session not found")
+    return row
+
+
+@app.get("/agent-sessions")
+async def list_agent_sessions(user: dict = Depends(require_admin)):
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """SELECT id, title, created_at, updated_at
+           FROM chat_sessions WHERE user_id = $1
+           ORDER BY updated_at DESC""",
+        AGENT_USER_ID,
+    )
+    return [
+        {"id": str(r["id"]), "title": r["title"],
+         "created_at": r["created_at"].isoformat(), "updated_at": r["updated_at"].isoformat()}
+        for r in rows
+    ]
+
+
+@app.get("/agent-sessions/{session_id}/messages")
+async def get_agent_messages(session_id: str, user: dict = Depends(require_admin)):
+    pool = await get_pool()
+    await _verify_agent_session(pool, session_id)
+    return await _fetch_session_messages(pool, session_id)
+
+
+@app.post("/agent-sessions/{session_id}/messages")
+async def send_agent_message(
+    session_id: str,
+    user: dict = Depends(require_admin),
+    content: str = Form(...),
+    model: Optional[str] = Form(None),
+):
+    """Admin sends a message into an agent session, continuing with the agent's system prompt."""
+    pool = await get_pool()
+    session = await _verify_agent_session(pool, session_id)
+    user_email = user.get("email")
+
+    prefixed = f"[user] {content}"
+    user_msg_row = await pool.fetchrow(
+        "INSERT INTO chat_messages (session_id, role, content) VALUES ($1, 'user', $2) RETURNING id",
+        session_id, prefixed,
+    )
+    user_msg_id = str(user_msg_row["id"])
+
+    asst_msg_id, gen = await _start_generation(
+        pool, session_id, user_email, str(user["sub"]),
+        prefixed, session["title"], model,
+        system_prompt=session["system_prompt"],
+    )
+
+    return _sse_response(
+        {"type": "user_message_id", "id": user_msg_id},
+        {"type": "assistant_message_id", "id": asst_msg_id},
+        gen=gen,
+    )
+
+
+@app.get("/agent-sessions/{session_id}/stream")
+async def stream_agent_session(session_id: str, user: dict = Depends(require_admin)):
+    pool = await get_pool()
+    await _verify_agent_session(pool, session_id)
+
+    gen = tasks.get_active(session_id)
+    if not gen:
+        return {"status": "no_active_generation"}
+
+    async def sse_stream():
+        async for event in gen.tail():
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        sse_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/agent-sessions/{session_id}/cancel")
+async def cancel_agent_generation(session_id: str, user: dict = Depends(require_admin)):
+    pool = await get_pool()
+    await _verify_agent_session(pool, session_id)
+
+    gen = tasks.get_active(session_id)
+    if not gen:
+        return {"ok": True, "was_active": False}
+    if gen.task and not gen.task.done():
+        gen.task.cancel()
+    return {"ok": True, "was_active": True}
 
 
 # =============================================================================

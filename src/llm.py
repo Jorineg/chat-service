@@ -210,7 +210,7 @@ def invalidate_model_cache():
 # ---------------------------------------------------------------------------
 
 
-async def _build_dynamic_context(pool: asyncpg.Pool, user_email: str | None) -> str:
+async def build_dynamic_context(pool: asyncpg.Pool, user_email: str | None) -> str:
     parts = [f"## Current Context\n- **User**: {user_email or 'unknown'}"]
     try:
         rows = await pool.fetch(
@@ -224,6 +224,12 @@ async def _build_dynamic_context(pool: asyncpg.Pool, user_email: str | None) -> 
     except Exception as e:
         logger.warning("Failed to fetch projects for context: %s", e)
     return "\n".join(parts)
+
+
+async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
+    """Build the full system prompt to snapshot on a new chat session."""
+    dynamic = await build_dynamic_context(pool, user_email)
+    return STATIC_SYSTEM_PROMPT + "\n\n" + dynamic
 
 # ---------------------------------------------------------------------------
 # Streaming chat response with shared tool loop
@@ -256,16 +262,14 @@ async def stream_chat_response(
 
     yield {"type": "model_resolved", "model": active_model}
 
-    if system_prompt:
-        from datetime import datetime, timezone
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        system = provider.build_system_prompt(system_prompt, f"Current time: {ts}")
-    else:
-        dynamic_context = await _build_dynamic_context(pool, user_email)
-        static = STATIC_SYSTEM_PROMPT
-        if model_config.get("system_prompt_addition"):
-            static += "\n\n" + model_config["system_prompt_addition"]
-        system = provider.build_system_prompt(static, dynamic_context)
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if not system_prompt:
+        dynamic_context = await build_dynamic_context(pool, user_email)
+        system_prompt = STATIC_SYSTEM_PROMPT + "\n\n" + dynamic_context
+    if model_config.get("system_prompt_addition"):
+        system_prompt += "\n\n" + model_config["system_prompt_addition"]
+    system = provider.build_system_prompt(system_prompt, f"Current time: {ts}")
     tools = [provider.build_tool_definition(TOOL_NAME, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA)]
     api_messages = provider.build_api_messages(messages)
 

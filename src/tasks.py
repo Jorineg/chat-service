@@ -81,6 +81,7 @@ async def run_generation(
     user_content: str,
     session_title: str | None,
     user_id: str | None = None,
+    system_prompt: str | None = None,
 ):
     """Run LLM generation as an independent task. Pushes events + writes to DB incrementally."""
     from .llm import stream_chat_response, generate_title
@@ -138,7 +139,10 @@ async def run_generation(
         conversation_files = await get_session_files(pool, gen.session_id)
         await sandbox.start(conversation_files)
 
-        async for event in stream_chat_response(history, pool, user_email, model_config, sandbox, gen.assistant_msg_id):
+        async for event in stream_chat_response(
+            history, pool, user_email, model_config, sandbox, gen.assistant_msg_id,
+            system_prompt=system_prompt,
+        ):
             etype = event["type"]
 
             # done/error are handled exclusively by _finalize — don't push raw

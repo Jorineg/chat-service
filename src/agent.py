@@ -12,6 +12,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
@@ -299,9 +300,10 @@ async def run_agent_turn(
     if not model_config:
         model_config = await _resolve_agent_model(pool)
 
+    title = f"PAA {datetime.now(timezone.utc).strftime('%d.%m.%y %H:%M')}"
     session_row = await pool.fetchrow(
-        "INSERT INTO chat_sessions (user_id, title) VALUES ($1, $2) RETURNING id",
-        AGENT_USER_ID, "Project Activity Agent",
+        "INSERT INTO chat_sessions (user_id, title, system_prompt) VALUES ($1, $2, $3) RETURNING id",
+        AGENT_USER_ID, title, system_prompt,
     )
     session_id = str(session_row["id"])
 
