@@ -290,6 +290,7 @@ async def run_agent_turn(
     model_config: dict | None = None,
     context_metadata: dict | None = None,
     nudge_check: Callable | None = None,
+    title_prefix: str = "PAA",
 ) -> AgentResult:
     """Run agent to completion with optional nudge loop.
 
@@ -300,7 +301,7 @@ async def run_agent_turn(
     if not model_config:
         model_config = await _resolve_agent_model(pool)
 
-    title = f"PAA {datetime.now(timezone.utc).strftime('%d.%m.%y %H:%M')}"
+    title = f"{title_prefix} {datetime.now(timezone.utc).strftime('%d.%m.%y %H:%M')}"
     session_row = await pool.fetchrow(
         "INSERT INTO chat_sessions (user_id, title, system_prompt) VALUES ($1, $2, $3) RETURNING id",
         AGENT_USER_ID, title, system_prompt,
@@ -432,10 +433,12 @@ async def orchestrator_loop(pool: asyncpg.Pool):
 async def _process_events(pool: asyncpg.Pool):
     """Find projects with unprocessed events and run the agent for each."""
     projects = await pool.fetch("""
-        SELECT DISTINCT tw_project_id
-        FROM project_event_log
-        WHERE NOT processed_by_agent
-        AND (processed_by_diff OR old_content IS NULL)
+        SELECT DISTINCT pel.tw_project_id
+        FROM project_event_log pel
+        JOIN teamwork.projects tp ON tp.id = pel.tw_project_id
+        WHERE NOT pel.processed_by_agent
+          AND (pel.processed_by_diff OR pel.old_content IS NULL)
+          AND tp.status = 'active'
     """)
     if not projects:
         return
@@ -553,6 +556,7 @@ async def _run_bootstrap_agent(pool: asyncpg.Pool, project_id: int, request_id: 
         AGENT_BOOTSTRAP_PROMPT, user_message, pool,
         context_metadata={"tw_project_id": project_id, "action": "bootstrap"},
         nudge_check=_bootstrap_nudge,
+        title_prefix="BST",
     )
 
     await pool.execute(

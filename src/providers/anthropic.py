@@ -14,7 +14,7 @@ TOOL_NAME = "run_python"
 
 class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
-        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0)
 
     def build_system_prompt(self, static: str, dynamic: str) -> list[dict]:
         return [

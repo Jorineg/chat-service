@@ -22,6 +22,12 @@ _SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "r
 
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
 
 
 def _strip_leaked_tokens(blocks: list[dict]):
@@ -38,6 +44,41 @@ def _strip_leaked_tokens(blocks: list[dict]):
 def _extract_code_blocks(text: str) -> list[str]:
     """Extract Python code from markdown fenced code blocks."""
     return [m.strip() for m in _MARKDOWN_CODE_RE.findall(text) if m.strip()]
+
+
+def empty_usage() -> dict:
+    """Create an empty usage object with stable keys."""
+    return {k: 0 for k in _USAGE_KEYS}
+
+
+def normalize_usage(usage: dict | None) -> dict:
+    """Normalize provider usage payload to the four tracked token counters."""
+    normalized = empty_usage()
+    if not usage:
+        return normalized
+    for key in _USAGE_KEYS:
+        normalized[key] = int(usage.get(key, 0) or 0)
+    return normalized
+
+
+def add_usage(total: dict, usage: dict | None) -> None:
+    """Accumulate normalized usage into a mutable totals dict."""
+    normalized = normalize_usage(usage)
+    for key in _USAGE_KEYS:
+        total[key] += normalized[key]
+
+
+def calculate_usage_cost_usd(model_config: dict | None, usage: dict | None) -> float:
+    """Calculate USD cost for a usage payload from model pricing fields."""
+    if not model_config or not usage:
+        return 0.0
+    normalized = normalize_usage(usage)
+    return (
+        normalized["input_tokens"] * float(model_config.get("input_price") or 0)
+        + normalized["output_tokens"] * float(model_config.get("output_price") or 0)
+        + normalized["cache_read_input_tokens"] * float(model_config.get("cache_read_price") or 0)
+        + normalized["cache_creation_input_tokens"] * float(model_config.get("cache_write_price") or 0)
+    ) / 1_000_000
 
 # ---------------------------------------------------------------------------
 # Tool definition (provider-agnostic content, formatted per-provider)
@@ -281,10 +322,9 @@ async def stream_chat_response(
     all_blocks: list[dict] = []
     full_text = ""
 
-    total_usage = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
-    }
+    total_usage = empty_usage()
+    subcalls: list[dict] = []
+    subcall_index = 0
 
     def _append_block(btype: str, text: str):
         if all_blocks and all_blocks[-1]["type"] == btype:
@@ -317,9 +357,15 @@ async def stream_chat_response(
                     return
 
                 turn_tool_calls = event["tool_calls"]
-                usage = event["usage"]
-                for k in total_usage:
-                    total_usage[k] += usage.get(k, 0)
+                usage = normalize_usage(event["usage"])
+                add_usage(total_usage, usage)
+                subcall_index += 1
+                subcalls.append({
+                    "kind": "llm_turn",
+                    "index": subcall_index,
+                    "stop_reason": event["stop_reason"],
+                    **usage,
+                })
 
                 if event["stop_reason"] != "tool_use":
                     # Check for code blocks in text that should be executed
@@ -340,12 +386,14 @@ async def stream_chat_response(
                         provider.append_assistant_turn(api_messages, turn_text, [])
                         continue
 
-                    total_usage["model"] = active_model
+                    metadata = {**total_usage, "model": active_model}
+                    if subcalls:
+                        metadata["subcalls"] = subcalls
                     yield {
                         "type": "done",
                         "content": full_text,
                         "blocks": all_blocks if all_blocks else None,
-                        "metadata": total_usage,
+                        "metadata": metadata,
                     }
                     return
 
@@ -353,9 +401,11 @@ async def stream_chat_response(
                 _strip_leaked_tokens(all_blocks)
 
         if not turn_tool_calls:
-            total_usage["model"] = active_model
+            metadata = {**total_usage, "model": active_model}
+            if subcalls:
+                metadata["subcalls"] = subcalls
             yield {"type": "done", "content": full_text,
-                   "blocks": all_blocks if all_blocks else None, "metadata": total_usage}
+                   "blocks": all_blocks if all_blocks else None, "metadata": metadata}
             return
 
         provider.append_assistant_turn(api_messages, turn_text, turn_tool_calls)
@@ -391,6 +441,18 @@ async def stream_chat_response(
                 output = "\n".join(parts) if parts else "(no output)"
                 tc_record["result"] = output
                 yield {"type": "tool_result", "id": tc_id, "result": output}
+
+            for tool_cost in result.get("tool_costs") or []:
+                cost_usd = float(tool_cost.get("cost_usd") or 0)
+                if cost_usd <= 0:
+                    continue
+                subcall_index += 1
+                subcalls.append({
+                    "kind": "tool",
+                    "index": subcall_index,
+                    "tool_name": tool_cost.get("tool_name") or TOOL_NAME,
+                    "cost_usd": cost_usd,
+                })
 
             # Upload new files from sandbox and append info to output
             if result.get("new_files") and sandbox and assistant_msg_id:
@@ -438,18 +500,26 @@ async def stream_chat_response(
                 _append_block("text", event["content"])
                 yield {"type": "text", "content": event["content"]}
             elif event["type"] == "turn_end":
-                usage = event.get("usage", {})
-                for k in total_usage:
-                    total_usage[k] += usage.get(k, 0)
+                usage = normalize_usage(event.get("usage"))
+                add_usage(total_usage, usage)
+                subcall_index += 1
+                subcalls.append({
+                    "kind": "llm_turn",
+                    "index": subcall_index,
+                    "stop_reason": event["stop_reason"],
+                    **usage,
+                })
     except Exception as e:
         logger.warning("Final nudge failed: %s", e)
 
-    total_usage["model"] = active_model
+    metadata = {**total_usage, "model": active_model}
+    if subcalls:
+        metadata["subcalls"] = subcalls
     yield {
         "type": "done",
         "content": full_text,
         "blocks": all_blocks if all_blocks else None,
-        "metadata": total_usage,
+        "metadata": metadata,
     }
 
 # ---------------------------------------------------------------------------

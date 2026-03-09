@@ -155,7 +155,7 @@ class SandboxSession:
     async def execute(self, code: str) -> dict:
         """Send code to sandbox, handle bridge requests, return result.
 
-        Returns: {stdout, result, error, pending_images, new_files}
+        Returns: {stdout, result, error, pending_images, new_files, tool_costs}
         """
         if not self._started:
             raise RuntimeError("Sandbox not started")
@@ -178,7 +178,7 @@ class SandboxSession:
             )
         except asyncio.TimeoutError:
             return {"stdout": None, "result": None, "error": f"Execution timed out after {EXEC_TIMEOUT_S}s",
-                    "pending_images": [], "new_files": []}
+                    "pending_images": [], "new_files": [], "tool_costs": []}
 
     def _handle_bridge_request_sync(self, msg: dict, loop: asyncio.AbstractEventLoop) -> dict:
         """Handle a proxy request from the sandbox (runs in executor thread)."""
@@ -234,7 +234,12 @@ class SandboxSession:
             )
             try:
                 desc = future.result(timeout=60)
-                return {"type": "describe_image_result", "description": desc}
+                return {
+                    "type": "describe_image_result",
+                    "description": desc["description"],
+                    "cost_usd": desc["cost_usd"],
+                    "tool_name": "describe_image",
+                }
             except Exception as e:
                 return {"type": "describe_image_result", "error": str(e)}
 
@@ -472,7 +477,7 @@ class SandboxSession:
 
         return f"/work/{Path(local_path).name}"
 
-    async def _describe_image(self, ref: str, question: str | None, page: int | None) -> str:
+    async def _describe_image(self, ref: str, question: str | None, page: int | None) -> dict:
         """Load an image and send it to a vision model for description."""
         image_data, media_type = await self._load_image(ref, page)
         if not image_data:
@@ -632,10 +637,10 @@ class SandboxSession:
 
 
 async def _call_vision_model(image_data: bytes, media_type: str, question: str | None,
-                             pool: asyncpg.Pool) -> str:
+                             pool: asyncpg.Pool) -> dict:
     """Call the vision fallback model to describe an image."""
     import base64
-    from .llm import resolve_model
+    from .llm import calculate_usage_cost_usd, normalize_usage, resolve_model
 
     vision_model_id = settings.VISION_FALLBACK_MODEL
     if not vision_model_id:
@@ -659,7 +664,16 @@ async def _call_vision_model(image_data: bytes, media_type: str, question: str |
                 {"type": "text", "text": prompt},
             ]}],
         )
-        return resp.content[0].text.strip()
+        usage = normalize_usage({
+            "input_tokens": getattr(resp.usage, "input_tokens", 0),
+            "output_tokens": getattr(resp.usage, "output_tokens", 0),
+            "cache_read_input_tokens": getattr(resp.usage, "cache_read_input_tokens", 0),
+            "cache_creation_input_tokens": getattr(resp.usage, "cache_creation_input_tokens", 0),
+        })
+        return {
+            "description": resp.content[0].text.strip(),
+            "cost_usd": calculate_usage_cost_usd(model_config, usage),
+        }
     else:
         from openai import AsyncOpenAI
         base_url = model_config.get("base_url", "https://api.tokenfactory.nebius.com/v1/")
@@ -671,7 +685,16 @@ async def _call_vision_model(image_data: bytes, media_type: str, question: str |
                 {"type": "text", "text": prompt},
             ]}],
         )
-        return (resp.choices[0].message.content or "").strip()
+        usage = normalize_usage({
+            "input_tokens": getattr(resp.usage, "prompt_tokens", 0) if resp.usage else 0,
+            "output_tokens": getattr(resp.usage, "completion_tokens", 0) if resp.usage else 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        })
+        return {
+            "description": (resp.choices[0].message.content or "").strip(),
+            "cost_usd": calculate_usage_cost_usd(model_config, usage),
+        }
 
 
 def _serialize_row(row: dict) -> dict:

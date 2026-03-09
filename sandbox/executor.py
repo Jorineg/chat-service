@@ -240,6 +240,7 @@ def main():
                 result = _run_code(msg["code"], env)
                 new_files = _detect_new_files(snapshot)
                 pending_images = env.get("_pending_images", [])
+                tool_costs = bridge.consume_tool_costs()
 
                 _send(sock, {
                     "type": "result",
@@ -248,6 +249,7 @@ def main():
                     "error": result["error"],
                     "pending_images": list(pending_images),
                     "new_files": new_files,
+                    "tool_costs": tool_costs,
                 })
                 pending_images.clear()
 

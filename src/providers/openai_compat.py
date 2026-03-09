@@ -59,7 +59,7 @@ def _rewrite_hallucinated_tool_call(tc: dict) -> dict:
 
 class OpenAICompatProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str):
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
 
     def build_system_prompt(self, static: str, dynamic: str) -> str:
         return f"{static}\n\n{dynamic}"

@@ -42,13 +42,26 @@ class BridgeClient:
 
     def __init__(self, sock):
         self._sock = sock
+        self._tool_costs: list[dict] = []
 
     def _request(self, msg_type: str, payload: dict | None = None) -> dict:
         msg = {"type": msg_type}
         if payload:
             msg.update(payload)
         _send(self._sock, msg)
-        return _recv(self._sock)
+        resp = _recv(self._sock)
+        cost = resp.get("cost_usd")
+        if isinstance(cost, (int, float)) and cost > 0:
+            self._tool_costs.append({
+                "tool_name": resp.get("tool_name") or msg_type,
+                "cost_usd": float(cost),
+            })
+        return resp
+
+    def consume_tool_costs(self) -> list[dict]:
+        costs = self._tool_costs
+        self._tool_costs = []
+        return costs
 
     def db(self, sql=None, **kwargs) -> list[dict]:
         sql = sql or kwargs.get("query") or kwargs.get("sql")
