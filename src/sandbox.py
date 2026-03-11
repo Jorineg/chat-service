@@ -302,7 +302,7 @@ class SandboxSession:
     ])
 
     async def _add_activity_entry(self, msg: dict) -> str:
-        """Insert a Tier 3 activity log entry. Returns the new UUID."""
+        """Insert a Tier 3 activity log entry. Returns the new UUID. Deduplicates by source_event_ids."""
         from datetime import datetime, timezone as tz
         category = msg["category"]
         if category not in self._VALID_CATEGORIES:
@@ -312,6 +312,14 @@ class SandboxSession:
             logged_at = datetime.fromisoformat(logged_at)
         if not logged_at:
             logged_at = datetime.now(tz.utc)
+        source_event_ids = msg.get("source_event_ids") or []
+        existing = await self.pool.fetchval("""
+            SELECT id FROM project_activity_log
+            WHERE tw_project_id = $1 AND summary = $2
+            LIMIT 1
+        """, msg["project_id"], msg["summary"])
+        if existing:
+            return str(existing)
         row = await self.pool.fetchrow("""
             INSERT INTO project_activity_log
                 (tw_project_id, logged_at, category, summary, source_event_ids, kgr_codes, involved_persons)
@@ -321,7 +329,7 @@ class SandboxSession:
             logged_at,
             category,
             msg["summary"],
-            msg.get("source_event_ids") or [],
+            source_event_ids,
             msg.get("kgr_codes") or [],
             msg.get("involved_persons") or [],
         )
