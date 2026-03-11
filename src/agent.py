@@ -13,16 +13,12 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 
 from . import settings
-from .llm import stream_chat_response, resolve_model
+from .llm import stream_chat_response, resolve_model, get_cached_schema
 from .sandbox import SandboxSession
-
-_DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
-_SCHEMA_DOC = (_DOCS_DIR / "schema_doc_output.md").read_text().strip() if (_DOCS_DIR / "schema_doc_output.md").exists() else ""
 
 logger = logging.getLogger("ibhelm.chat.agent")
 
@@ -64,22 +60,106 @@ Semantic summaries of what happened. Each entry has a `category` and a concise `
 
 **Categories:** `decision`, `blocker`, `resolution`, `progress`, `milestone`, `risk`, `scope_change`, `communication`
 
+**The bar for creating a Tier 3 entry is HIGH.** Ask: "Would a project manager care about this in a weekly briefing?" \
+If not, skip it. Producing zero entries is completely normal and expected for routine events.
+
+**What to SKIP (do NOT create Tier 3 entries for):**
+- Due date shifts (task postponed by a few days/weeks) — this is routine scheduling, not activity
+- Task creation without context — "3 new tasks created" is Tier 4 data rephrased, not insight
+- Priority changes — changing a task from normal to high priority is metadata, not narrative
+- Progress percentage changes — going from 70% to 80% is noise
+- Document uploads/edits without meaningful content change
+- Any event where your summary would just rephrase the Tier 4 event in prose without adding interpretation
+
+**What IS worth a Tier 3 entry:**
+- Decisions made (variant selected, approach confirmed, requirement dropped)
+- Blockers identified (waiting on external input, supplier issue, technical problem)
+- Blockers resolved (answer received, alternative found)
+- Real milestones (phase completed, handover done, Abnahme passed)
+- Risks surfaced (supplier dropout, technical constraint discovered)
+- Scope changes (room dropped, Gewerk added, requirement changed)
+- Meaningful communication (new stakeholder contact, important email exchange, meeting outcome)
+- Significant progress (not task churn — actual deliverables: schema sent for review, Angebotsauswertung complete)
+
 **Guidelines:**
-- 1-3 sentences per entry, in German
-- Group related events into single entries when they tell one story
-- You may produce zero, one, or multiple entries per run — whatever fits the events
-- Skip truly irrelevant changes: typo fixes, wording tweaks, routine metadata updates without semantic meaning. \
-It is perfectly fine to produce no Tier 3 entries if the events contain nothing noteworthy.
-- Include `source_event_ids` linking back to Tier 4 events
-- Include `kgr_codes` (e.g. "KGR 434") when events relate to specific Kostengruppen
-- Include `involved_persons` when specific people are mentioned
+- 1-3 sentences per entry, in German. Focus on WHY it matters, not WHAT happened mechanically.
+- Group related events aggressively — 5 similar task-creation events become ONE entry or NONE.
+- Use the right category. `progress` is NOT a catch-all. If it's a decision, call it `decision`. \
+If nothing fits well, the events are probably not worth a Tier 3 entry.
+- `milestone` means a real milestone (phase complete, Abnahme, handover) — NOT a date being rescheduled.
+- Include `source_event_ids` linking back to Tier 4 events.
+- Include `kgr_codes` (e.g. "KGR 434") when events relate to specific Kostengruppen.
+- Include `involved_persons` — always use "Vorname Nachname" format (e.g. "Jörg Helm", never "Helm Jörg"). \
+Normalize names consistently. No leading/trailing spaces.
+
+### Tier 1: Project Profile (markdown, rarely changes)
+A standardized, **timeless** project overview. Describes what the project IS — not where it stands. \
+Only update on major scope changes (new Gewerk added, client changed, building changed).
+
+**Mandatory sections in this order:**
+1. `## Projekt` — 2-3 sentences: what is being built/planned, for whom, where.
+2. `## Auftraggeber & Beteiligte` — client, key contacts, planning team, contractors.
+3. `## Standort` — location, buildings, rooms. Omit if obvious from Projekt section.
+4. `## Gewerke & Systeme` — KGR list with key technical parameters (capacities, temperatures, equipment types). \
+This is THE reference for technical specs — Tier 2 must not repeat them.
+5. `## Umfang & Randbedingungen` — project phases, special constraints, interfaces.
+
+**Rules:**
+- **No temporal language.** Never write "aktuell", "derzeit", "offen", "läuft", "in Arbeit", "geplant für März 2026", \
+or anything that describes current state. If it can become outdated next week, it does not belong here.
+- **No status sections.** No "Aktueller Projektstatus", no "Nächste Schritte", no "Offene Punkte".
+- **No headers beyond the 5 above.** No `# Tier 1: ...` title, no `# Projektprofil: ...`, no footers with dates.
+- **Minimal projects:** If data is sparse, write 3-5 lines total. Do NOT speculate about potential Gewerke \
+or pad with placeholder content. Only document what is known.
+- **Length guidance:** ~500-1500 tokens depending on project complexity.
+
+**Example:**
+```
+## Projekt
+Planung der Klimatisierung und IT-Infrastruktur für zwei Serverräume \
+bei Firma X am Standort Y in Z.
+
+## Auftraggeber & Beteiligte
+- Auftraggeber: Firma X
+- Ansprechpartner: Hr. Müller (IT), Hr. Schmidt (Elektro)
+- Statik: IB Statik (Hr. Weber)
+
+## Standort
+Gebäude W5, Serverraum (FL06) und Backup-Raum. \
+Bestehende Stahlbühne, Dachaufstellung für Rückkühler.
+
+## Gewerke & Systeme
+- KGR 434 Kälteanlagen: 80 kW Serverraum, 20 kW Backupraum, Klimaschränke, Rückkühler, Freikühlung, n+1-Redundanz
+- KGR 440 Elektro: 120 kW + 30 kW, zentrale USV, TN-S-Umrüstung
+- KGR 474 Brandschutz: N2-Gaslöschanlage, Druckentlastungsklappen
+
+## Umfang & Randbedingungen
+Entwurfsplanung bis LV-Erstellung. 24/7-Betrieb, Umbau bei laufendem Betrieb. \
+Bestandsgebäude mit eingeschränkter Tragfähigkeit. Schallkontingent Dach knapp.
+```
 
 ### Tier 2: Current Status Snapshot (markdown, what you maintain)
 A markdown document per project capturing the **current state only**. Resolved items belong in Tier 3, not here.
 
-**Structure:** Section by Gewerk (KGR cost group) when applicable. Simple projects with one Gewerk are short; \
-complex projects scale proportionally.
-**Length guidance:** ~50-150 tokens per active Gewerk section, ~100-200 tokens for general sections.
+**CRITICAL: Tier 2 must NEVER repeat information from Tier 1.** Tier 1 and Tier 2 are always read together. \
+Do not re-state technical specs, capacities, temperatures, equipment models, team members, or project scope. \
+Reference Gewerke by KGR name only, then state what is happening NOW.
+
+**Mandatory sections in this order:**
+1. `## Aktueller Stand` — 2-3 sentence overview of the current project phase and key focus.
+2. `## KGR XXX — Name` — one section per Gewerk with active work. Only status: what was done, what is blocked, what is next. \
+Omit Gewerke with no current activity.
+3. `## Nächste Schritte` — bullet list of upcoming actions with deadlines.
+
+**Rules:**
+- **No technical specs.** Do not write "80 kW Kühlleistung" or "Gaskühler max. 58°C" — that is in Tier 1.
+- **No team/contact sections.** Stakeholders are in Tier 1. Only mention people when they are blocking or responsible \
+for a specific pending action.
+- **No admin task dumps.** "Terminvorbereitung, Ortstermin, Schriftwechsel" is not status.
+- **No title headers** like `# Tier 2: ...` or `# Aktueller Projektstatus`. Start with `## Aktueller Stand`.
+- **No footers** with dates or metadata.
+- **Tier 2 should be shorter than Tier 1** in most cases. Exception: projects in active construction with many parallel workstreams.
+- **Length guidance:** ~50-150 tokens per active Gewerk section, ~100-200 tokens for general sections.
 
 **Example:**
 ```
@@ -87,7 +167,7 @@ complex projects scale proportionally.
 Projekt in Entwurfsplanung. Nächste Baubesprechung am 13.03.
 
 ## KGR 434 — Kälteanlagen
-Variante B für Serverraum bestätigt. 4 Klimaschränke.
+Variante B für Serverraum bestätigt. \
 Warten auf finale USV-Kapazitätsdaten von Firma X für Dimensionierung.
 
 ## KGR 440 — Elektrische Anlagen
@@ -95,36 +175,24 @@ Elektroleistungszusammenstellung in Arbeit (Fällig: 13.03).
 
 ## Nächste Schritte
 - Finale Entscheidung Aufstellvariante BR/SR (Fällig: 13.03)
+- Termin mit GLT-Verantwortlichen
 ```
 
-### Tier 1: Project Profile (markdown, rarely changes)
-A standardized project overview: scope, client, stakeholders, locations, systems, constraints. \
-Only update on major scope changes.
-**Length guidance:** ~500-1500 tokens depending on project complexity.
-
-**Example:**
+**Anti-pattern — do NOT write Tier 2 like this:**
 ```
-## Projekt
-Planung der Klimatisierung und IT-Infrastruktur für zwei Serverräume
-bei Firma X am Standort Y in Z.
-
-## Auftraggeber & Beteiligte
-- Auftraggeber: Firma X
-- Ansprechpartner: Hr. Müller (IT), Hr. Schmidt (Elektro)
-
-## Gewerke & Systeme
-- KGR 434 Kälteanlagen: Klimaschränke, Rückkühler, Kühlwassersystem
-- KGR 440 Elektro: USV-Versorgung, Bestandsverkabelung
-
-## Umfang & Randbedingungen
-Entwurfsplanung bis LV-Erstellung. Bestandsgebäude mit eingeschränkter Tragfähigkeit.
+## KGR 434 — Kälteanlagen
+80 kW Kühlleistung für Serverraum mit 4 Klimaschränken und Freikühlung (n+1-Redundanz). ← WRONG: repeats Tier 1 specs
+Marktabfrage durchgeführt, Angebotsauswertung liegt vor. ← CORRECT: this is status
 ```
 
 ## Database Schema
 
 Use this reference for all `db()` queries.
 
-""" + _SCHEMA_DOC + """
+{agent_schema}
+
+For the complete schema (all tables, columns, FKs), call: `db("SELECT get_full_schema()")`
+For a specific schema only: `db("SELECT get_full_schema('missive')")`
 
 ## Tool: run_python
 
@@ -162,8 +230,9 @@ is insufficient. This often produces much better, more specific summaries.
 
 - **Craft doc media**: URLs in Craft markdown like `.../craft-files/DOC_ID/BLOCK_ID_filename.pdf` — use \
 `download_craft_file("DOC_ID/BLOCK_ID_filename.pdf")` to pull into /work/.
-- **NAS files**: Use `download_file(content_hash)` with the hash from `file_contents` table.
-- **Email attachments**: Query `email_attachment_files` → `file_contents` to get the content_hash, then `download_file()`.
+- **NAS files**: Use `v_project_files` to find files (has `content_hash`), then `download_file(content_hash)` to pull into /work/.
+- **Email attachments**: Use `v_project_emails` to find emails with attachments, then `v_project_files` \
+(filter by `source_email_subject`) to find the downloaded file and its `content_hash`.
 
 Once a file is in /work/, use `file_image(path)` to view images, `file_text(path)` to extract text from PDFs/docs, \
 or `describe_image(path, question)` for vision analysis.
@@ -200,23 +269,40 @@ Craft doc content, related tasks, previous email threads, etc. Better context pr
 AGENT_BOOTSTRAP_PROMPT = _TIER_CONTEXT + """\
 ## Your specific task: Bootstrap Tier 1 and Tier 2 from scratch
 
-Generate a comprehensive Tier 1 (profile) and Tier 2 (status) for this project by reading ALL available data:
+Generate Tier 1 (profile) and Tier 2 (status) for this project by reading ALL available data.
 
-1. Use `db(sql)` to read:
-   - Project info: `SELECT * FROM teamwork.projects WHERE id = {project_id}`
-   - Craft docs: `SELECT cd.title, cd.markdown_content FROM craft_documents cd JOIN project_craft_documents pcd ON cd.id = pcd.craft_document_id WHERE pcd.tw_project_id = {project_id}`
-   - Current tasks with structure: tasklists, statuses, assignees, tags (especially KGR tags)
-   - Recent emails: subjects, senders (via project_conversations + missive tables)
-   - Project extensions: locations, cost groups, client, contractors
-   - Files: recent project files
+### Step 1: Read project data
+Use `db(sql)` to read:
+- Project info: `SELECT * FROM v_projects WHERE project_id = {project_id}`
+- Craft docs: `SELECT title, markdown_content FROM v_project_craft_docs WHERE project_id = {project_id}`
+- Tasks with assignees/tags/KGR: `SELECT * FROM v_project_tasks WHERE project_id = {project_id}`
+- Recent emails: `SELECT subject, from_name, body_plain_text, delivered_at FROM v_project_emails WHERE project_id = {project_id} ORDER BY delivered_at DESC`
+- Contractors: `SELECT up.display_name, pc.role FROM project_contractors pc JOIN unified_person_details up ON pc.contractor_person_id = up.id WHERE pc.tw_project_id = {project_id}`
+- Files: `SELECT filename, document_type, extracted_text FROM v_project_files WHERE project_id = {project_id} ORDER BY fs_mtime DESC`
 
-2. From all this data, generate:
-   - **Tier 1 (Profile):** Standardized overview — scope, client, stakeholders, locations, systems (Gewerke/KGR), constraints. Draw especially from Craft docs (Machbarkeit/feasibility studies) and Anforderungen tasklist.
-   - **Tier 2 (Status):** Current state snapshot — what's active, what's blocked, next steps. Sectioned by Gewerk (KGR). Reflect only current state.
+Read the Craft docs thoroughly — they contain the richest project context.
 
-3. Write results via `update_project_profile(project_id, markdown)` and `update_project_status(project_id, markdown)`.
+### Step 2: Write Tier 1 first
+Timeless project profile. All technical specs, stakeholders, locations, Gewerke go here. \
+Use ONLY the 5 mandatory sections. No temporal language, no current status.
 
-Read the Craft docs thoroughly — they contain the richest project context (scope, requirements, technical details).
+If the project has very little data (just created, no docs/emails), write a minimal 3-5 line profile. \
+Do NOT speculate about potential Gewerke or pad with filler.
+
+Write via `update_project_profile(project_id, markdown)`.
+
+### Step 3: Write Tier 2 second
+Current status snapshot. Reference Gewerke by name only — NEVER repeat specs from Tier 1. \
+Focus exclusively on: what phase is the project in, what is actively being worked on, \
+what is blocked, and what are the next concrete steps.
+
+Write via `update_project_status(project_id, markdown)`.
+
+### Step 4: Self-check
+Before writing, verify:
+- Does Tier 1 contain any "aktuell/derzeit/offen/läuft" language? → Remove it.
+- Does Tier 2 repeat any number, capacity, temperature, or equipment spec from Tier 1? → Remove it.
+- Is Tier 2 shorter than Tier 1? → If not, trim Tier 2 (it should be a snapshot, not a second profile).
 """
 
 
@@ -483,9 +569,12 @@ async def _run_event_agent(pool: asyncpg.Pool, project_id: int):
 
     user_message = _build_event_prompt(project_id, project_name, events, current_t1, current_t2, recent_t3)
 
+    schema = await get_cached_schema(pool)
+    prompt = AGENT_EVENT_PROMPT.replace("{agent_schema}", schema)
+
     logger.info("Running event agent for project %s (%s) — %d events", project_id, project_name, len(events))
     result = await run_agent_turn(
-        AGENT_EVENT_PROMPT, user_message, pool,
+        prompt, user_message, pool,
         context_metadata={"tw_project_id": project_id, "action": "events"},
     )
 
@@ -551,9 +640,12 @@ async def _run_bootstrap_agent(pool: asyncpg.Pool, project_id: int, request_id: 
             f"Tier 1 profile and Tier 2 status for project {project_id}."
         )
 
+    schema = await get_cached_schema(pool)
+    prompt = AGENT_BOOTSTRAP_PROMPT.replace("{agent_schema}", schema)
+
     logger.info("Running bootstrap agent for project %s (%s)", project_id, project_name)
     result = await run_agent_turn(
-        AGENT_BOOTSTRAP_PROMPT, user_message, pool,
+        prompt, user_message, pool,
         context_metadata={"tw_project_id": project_id, "action": "bootstrap"},
         nudge_check=_bootstrap_nudge,
         title_prefix="BST",

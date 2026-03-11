@@ -15,10 +15,25 @@ from .providers import get_provider
 
 logger = logging.getLogger("ibhelm.chat.llm")
 
-# Auto-generated schema doc and sandbox requirements (loaded once at import)
-_DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
-_SCHEMA_DOC = (_DOCS_DIR / "schema_doc_output.md").read_text().strip() if (_DOCS_DIR / "schema_doc_output.md").exists() else ""
+# Sandbox requirements (loaded once at import)
 _SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").read_text().strip() if (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").exists() else ""
+
+# Schema doc: loaded from DB function at runtime (cached 5 min)
+_schema_cache: dict = {"text": "", "ts": 0.0}
+
+
+async def get_cached_schema(pool: asyncpg.Pool) -> str:
+    import time
+    now = time.time()
+    if _schema_cache["text"] and now - _schema_cache["ts"] < 300:
+        return _schema_cache["text"]
+    try:
+        text = await pool.fetchval("SELECT get_agent_schema()") or ""
+        _schema_cache.update(text=text, ts=now)
+        return text
+    except Exception as e:
+        logger.warning("Failed to load agent schema from DB: %s", e)
+        return _schema_cache["text"]
 
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
@@ -166,41 +181,38 @@ You have one tool: `run_python`. Execute Python code in an isolated container wi
 
 ### File IDs
 - Files attached to messages have UUIDs (use with file_info, file_text, file_image, download_url).
-- NAS files found via SQL have a `content_hash` in the `file_contents` table (use with download_file to pull into /work/).
-- The `files` table has: id, full_path, content_hash, project_id. Join with `file_contents` for size, mime_type, extracted_text.
+- NAS files found via `v_project_files` have a `content_hash` column (use with download_file to pull into /work/).
+- `v_project_files` already includes extracted_text, storage_path, thumbnail_path — no extra JOINs needed.
 
 ### Example
 ```python
 tasks = db(\"\"\"
-    SELECT t.id, t.name, t.due_date, t.status,
-           string_agg(u.first_name || ' ' || u.last_name, ', ') as assignees
-    FROM teamwork.tasks t
-    LEFT JOIN teamwork.task_assignees ta ON t.id = ta.task_id
-    LEFT JOIN teamwork.users u ON ta.user_id = u.id
-    WHERE t.project_id = 682843 AND t.status != 'completed'
-      AND t.due_date < NOW()
-    GROUP BY t.id, t.name, t.due_date, t.status
-    ORDER BY t.due_date
+    SELECT task_id, name, due_date, status, assignees, cost_groups
+    FROM v_project_tasks
+    WHERE project_id = 682843 AND status != 'completed'
+      AND due_date < NOW()
+    ORDER BY due_date
 \"\"\")
 print(fmt(tasks))
 ```
 
 ## Database Schema
-""" + _SCHEMA_DOC + """
+{agent_schema}
+
+For the complete schema (all tables, columns, FKs), call: `db("SELECT get_full_schema()")`
+For a specific schema: `db("SELECT get_full_schema('missive')")`
 
 ## Generating Links
 When you mention specific tasks, emails, projects, or documents, always include clickable Markdown links.
 
-- **Teamwork task/Anforderung/Hinweis**: `[Task Name](https://ibhelm.teamwork.com/#/tasks/{task_id})`
+- **Teamwork task**: `[Task Name](https://ibhelm.teamwork.com/#/tasks/{task_id})` — `v_project_tasks` has a `url` column
 - **Teamwork project**: `[Project Name](https://ibhelm.teamwork.com/app/projects/{project_id})`
-- **Missive conversation**: `[Subject](https://mail.missiveapp.com/#inbox/conversations/{conversation_id})` — or use the `web_url` column from `missive.conversations`
-- **Craft document**: `[Title](craftdocs://open?spaceId=fa51f40a-da64-2cc0-6a32-d489be2d5528&blockId={document_id})` — opens directly in Craft app
-- The `unified_items_secure` view has `teamwork_url`, `missive_url`, and `craft_url` columns for convenience.
+- **Missive conversation**: `[Subject](https://mail.missiveapp.com/#inbox/conversations/{conversation_id})` — `v_project_emails` has a `missive_url` column
+- **Craft document**: `[Title](craftdocs://open?blockId={document_id})` — `v_project_craft_docs` has a `craft_url` column
 
 ## Row Level Security (RLS)
-The database enforces row-level security. Email-related queries through `unified_items_secure` \
-are automatically filtered by the current user's visibility. You will only see emails the user \
-has access to. This is normal — do not treat missing results as an error.
+The database enforces row-level security. Email visibility is automatically filtered \
+by the current user's access. This is normal — do not treat missing results as an error.
 
 ## Limitations
 - The database is READ-ONLY. No INSERT, UPDATE, or DELETE.
@@ -267,10 +279,15 @@ async def build_dynamic_context(pool: asyncpg.Pool, user_email: str | None) -> s
     return "\n".join(parts)
 
 
+async def _build_system_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
+    schema = await get_cached_schema(pool)
+    dynamic = await build_dynamic_context(pool, user_email)
+    return STATIC_SYSTEM_PROMPT.replace("{agent_schema}", schema) + "\n\n" + dynamic
+
+
 async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
     """Build the full system prompt to snapshot on a new chat session."""
-    dynamic = await build_dynamic_context(pool, user_email)
-    return STATIC_SYSTEM_PROMPT + "\n\n" + dynamic
+    return await _build_system_prompt(pool, user_email)
 
 # ---------------------------------------------------------------------------
 # Streaming chat response with shared tool loop
@@ -306,8 +323,7 @@ async def stream_chat_response(
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     if not system_prompt:
-        dynamic_context = await build_dynamic_context(pool, user_email)
-        system_prompt = STATIC_SYSTEM_PROMPT + "\n\n" + dynamic_context
+        system_prompt = await _build_system_prompt(pool, user_email)
     if model_config.get("system_prompt_addition"):
         system_prompt += "\n\n" + model_config["system_prompt_addition"]
     system = provider.build_system_prompt(system_prompt, f"Current time: {ts}")
