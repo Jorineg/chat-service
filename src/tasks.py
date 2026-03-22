@@ -135,7 +135,7 @@ async def run_generation(
         asyncio.create_task(_gen_title())
 
     try:
-        sandbox = SandboxSession(pool, user_email, gen.session_id, user_id=user_id)
+        sandbox = SandboxSession(pool, user_email, gen.session_id, user_id=user_id, model_id=model_config["id"])
         conversation_files = await get_session_files(pool, gen.session_id)
         await sandbox.start(conversation_files)
 

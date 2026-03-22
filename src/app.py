@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import settings, storage
+from . import template_resolver as tr
 from .auth import get_current_user, require_admin
 from .database import get_pool, close_pool
 from .llm import get_model_configs, invalidate_model_cache, resolve_model, build_session_prompt
@@ -28,10 +29,12 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL))
     logger.info("Chat Service starting on port %s", settings.PORT)
 
+    pool = await get_pool()
+    await tr.start_listener(pool)
+
     agent_task = None
     if settings.AGENT_ENABLED:
         from .agent import orchestrator_loop
-        pool = await get_pool()
         agent_task = asyncio.create_task(orchestrator_loop(pool))
         logger.info("Project activity agent started")
 
@@ -208,6 +211,18 @@ async def get_messages(session_id: str, user: dict = Depends(get_current_user)):
     if not session:
         raise HTTPException(404, "Session not found")
     return await _fetch_session_messages(pool, session_id)
+
+
+@app.get("/sessions/{session_id}/system-prompt")
+async def get_system_prompt(session_id: str, user: dict = Depends(get_current_user)):
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT system_prompt FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        session_id, user["sub"]
+    )
+    if not row:
+        raise HTTPException(404, "Session not found")
+    return {"system_prompt": row["system_prompt"]}
 
 
 class MessageUpdate(BaseModel):
@@ -664,6 +679,13 @@ async def get_agent_messages(session_id: str, user: dict = Depends(require_admin
     pool = await get_pool()
     await _verify_agent_session(pool, session_id)
     return await _fetch_session_messages(pool, session_id)
+
+
+@app.get("/agent-sessions/{session_id}/system-prompt")
+async def get_agent_system_prompt(session_id: str, user: dict = Depends(require_admin)):
+    pool = await get_pool()
+    session = await _verify_agent_session(pool, session_id)
+    return {"system_prompt": session["system_prompt"]}
 
 
 @app.post("/agent-sessions/{session_id}/messages")

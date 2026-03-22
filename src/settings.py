@@ -17,6 +17,7 @@ CHAT_FILES_BUCKET = os.getenv("CHAT_FILES_BUCKET", "chat-files")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 NEBIUS_API_KEY = os.getenv("NEBIUS_API_KEY")
+LINKUP_API_KEY = os.getenv("LINKUP_API_KEY")
 
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 TITLE_MODEL = os.getenv("TITLE_MODEL")

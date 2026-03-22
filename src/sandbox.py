@@ -15,13 +15,16 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import asyncpg
+import httpx
 
 from . import settings, storage
 
@@ -39,6 +42,29 @@ SANDBOX_MEM_LIMIT = os.getenv("SANDBOX_MEM_LIMIT", "2g")
 SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "200"))
 EXEC_TIMEOUT_S = int(os.getenv("SANDBOX_EXEC_TIMEOUT", "60"))
 QUERY_TIMEOUT_S = 10
+WEB_SEARCH_MAX_QUERY_LEN = 400
+WEB_SEARCH_MAX_PER_SESSION = 10
+WEB_FETCH_MAX_PER_SESSION = 10
+
+# Linkup API pricing (EUR, converted to USD at ~1.08)
+_LINKUP_COST_USD = {
+    "search_standard": 0.0054,
+    "search_deep": 0.054,
+    "fetch": 0.0011,
+    "fetch_js": 0.0054,
+}
+
+_EXFIL_PATTERNS = [
+    re.compile(r'[A-Za-z0-9+/=]{50,}'),        # base64
+    re.compile(r'[0-9a-f]{32,}', re.I),          # hex hash
+    re.compile(r'[\w.+-]+@[\w.-]+\.\w{2,}'),     # email address
+    re.compile(r'eyJ[A-Za-z0-9_-]{20,}'),        # JWT
+]
+
+
+def _looks_like_exfiltration(text: str) -> bool:
+    return any(p.search(text) for p in _EXFIL_PATTERNS)
+
 
 _HEADER_FMT = "!I"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
@@ -69,16 +95,22 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 class SandboxSession:
     """Manages one sandbox container for the duration of an assistant response."""
 
-    def __init__(self, pool: asyncpg.Pool, user_email: str | None, session_id: str, user_id: str | None = None):
+    def __init__(self, pool: asyncpg.Pool, user_email: str | None, session_id: str,
+                 user_id: str | None = None, model_id: str | None = None,
+                 agent_context: str = 'chat'):
         self.pool = pool
         self.user_email = user_email
         self.user_id = user_id
+        self.model_id = model_id
+        self.agent_context = agent_context
         self.session_id = session_id
         self._container_id: str | None = None
         self._shared_dir: str | None = None
         self._server_sock: socket.socket | None = None
         self._conn: socket.socket | None = None
         self._started = False
+        self._web_search_count = 0
+        self._web_fetch_count = 0
 
     async def start(self, conversation_files: list[dict] | None = None):
         """Create shared volume, start container, establish socket connection."""
@@ -185,7 +217,9 @@ class SandboxSession:
         msg_type = msg["type"]
 
         if msg_type == "db_query":
-            future = asyncio.run_coroutine_threadsafe(self._exec_query(msg["sql"]), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._exec_query(msg["sql"], msg.get("params")), loop
+            )
             try:
                 rows = future.result(timeout=QUERY_TIMEOUT_S)
                 return {"type": "db_result", "rows": rows}
@@ -253,6 +287,16 @@ class SandboxSession:
             except Exception as e:
                 return {"type": "add_activity_entry_result", "error": str(e)}
 
+        if msg_type == "update_activity_entry":
+            future = asyncio.run_coroutine_threadsafe(
+                self._update_activity_entry(msg), loop
+            )
+            try:
+                result = future.result(timeout=10)
+                return {"type": "update_activity_entry_result", "ok": True, "message": result}
+            except Exception as e:
+                return {"type": "update_activity_entry_result", "error": str(e)}
+
         if msg_type == "update_project_status":
             future = asyncio.run_coroutine_threadsafe(
                 self._update_project_status(msg["project_id"], msg["markdown"]), loop
@@ -273,10 +317,50 @@ class SandboxSession:
             except Exception as e:
                 return {"type": "update_project_profile_result", "error": str(e)}
 
+        if msg_type == "web_search":
+            query = (msg.get("query") or "")[:WEB_SEARCH_MAX_QUERY_LEN]
+            depth = msg.get("depth", "standard")
+            if depth not in ("standard", "deep"):
+                depth = "standard"
+            if not query.strip():
+                return {"type": "web_search_result", "error": "Empty query"}
+            if _looks_like_exfiltration(query):
+                return {"type": "web_search_result", "error": "Query rejected by security filter"}
+            self._web_search_count += 1
+            if self._web_search_count > WEB_SEARCH_MAX_PER_SESSION:
+                return {"type": "web_search_result", "error": f"Rate limit: max {WEB_SEARCH_MAX_PER_SESSION} searches per session"}
+            future = asyncio.run_coroutine_threadsafe(self._web_search(query, depth), loop)
+            try:
+                result = future.result(timeout=30)
+                return result
+            except Exception as e:
+                return {"type": "web_search_result", "error": str(e)}
+
+        if msg_type == "fetch_url":
+            url = msg.get("url", "")
+            if not url:
+                return {"type": "fetch_url_result", "error": "Empty URL"}
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return {"type": "fetch_url_result", "error": "Only HTTP/HTTPS URLs allowed"}
+            if not parsed.hostname or parsed.hostname in ("localhost", "127.0.0.1", "0.0.0.0"):
+                return {"type": "fetch_url_result", "error": "Local URLs not allowed"}
+            if _looks_like_exfiltration(url):
+                return {"type": "fetch_url_result", "error": "URL rejected by security filter"}
+            self._web_fetch_count += 1
+            if self._web_fetch_count > WEB_FETCH_MAX_PER_SESSION:
+                return {"type": "fetch_url_result", "error": f"Rate limit: max {WEB_FETCH_MAX_PER_SESSION} fetches per session"}
+            future = asyncio.run_coroutine_threadsafe(self._fetch_url(url), loop)
+            try:
+                result = future.result(timeout=30)
+                return result
+            except Exception as e:
+                return {"type": "fetch_url_result", "error": str(e)}
+
         return {"type": "error", "error": f"Unknown request type: {msg_type}"}
 
-    async def _exec_query(self, sql: str) -> list[dict]:
-        """Execute a read-only SQL query with RLS."""
+    async def _exec_query(self, sql: str, params: list | None = None) -> list[dict]:
+        """Execute a read-only SQL query with RLS and optional parameters."""
         stripped = sql.strip().rstrip(';').strip()
         upper = stripped.upper()
         while upper.startswith('--'):
@@ -293,7 +377,14 @@ class SandboxSession:
                     await conn.execute("SELECT set_config('app.user_email', $1, true)", self.user_email)
                 if self.user_id:
                     await conn.execute("SELECT set_config('app.user_id', $1, true)", self.user_id)
-                rows = await conn.fetch(sql)
+                if self.model_id:
+                    await conn.execute("SELECT set_config('app.model_id', $1, true)", self.model_id)
+                await conn.execute("SELECT set_config('app.session_id', $1, true)", self.session_id)
+                await conn.execute("SELECT set_config('app.agent_context', $1, true)", self.agent_context)
+                if params:
+                    rows = await conn.fetch(sql, *params)
+                else:
+                    rows = await conn.fetch(sql)
             return [_serialize_row(dict(r)) for r in rows]
 
     _VALID_CATEGORIES = frozenset([
@@ -335,6 +426,68 @@ class SandboxSession:
         )
         return str(row["id"])
 
+    async def _update_activity_entry(self, msg: dict) -> str:
+        """Update a recent Tier 3 activity log entry. Only entries < 48h old and same project."""
+        from datetime import datetime, timezone as tz
+        entry_id = msg.get("entry_id")
+        if not entry_id:
+            raise ValueError("entry_id is required")
+
+        row = await self.pool.fetchrow(
+            "SELECT tw_project_id, generated_at FROM project_activity_log WHERE id = $1",
+            entry_id,
+        )
+        if not row:
+            raise ValueError(f"Entry not found: {entry_id}")
+
+        age_hours = (datetime.now(tz.utc) - row["generated_at"]).total_seconds() / 3600
+        if age_hours > 48:
+            raise ValueError(
+                f"Entry is {age_hours:.0f}h old — only entries less than 48h old can be updated. "
+                f"Create a new entry instead."
+            )
+
+        sets, params = [], [entry_id]
+        idx = 2
+
+        if "summary" in msg:
+            sets.append(f"summary = ${idx}")
+            params.append(msg["summary"])
+            idx += 1
+
+        if "category" in msg:
+            cat = msg["category"]
+            if cat not in self._VALID_CATEGORIES:
+                raise ValueError(f"Invalid category: {cat}")
+            sets.append(f"category = ${idx}")
+            params.append(cat)
+            idx += 1
+
+        if "kgr_codes" in msg:
+            sets.append(f"kgr_codes = ${idx}")
+            params.append(msg["kgr_codes"])
+            idx += 1
+
+        if "involved_persons" in msg:
+            sets.append(f"involved_persons = ${idx}")
+            params.append(msg["involved_persons"])
+            idx += 1
+
+        append_ids = msg.get("append_source_event_ids") or []
+        if append_ids:
+            sets.append(f"source_event_ids = array_cat(source_event_ids, ${idx}::bigint[])")
+            params.append(append_ids)
+            idx += 1
+
+        if not sets:
+            raise ValueError("Nothing to update — provide at least one field (summary, category, kgr_codes, involved_persons, append_source_event_ids)")
+
+        await self.pool.execute(
+            f"UPDATE project_activity_log SET {', '.join(sets)} WHERE id = $1",
+            *params,
+        )
+        return f"Entry {entry_id} updated"
+
     async def _update_project_status(self, project_id: int, markdown: str) -> str:
         """Update Tier 2 status markdown with length protection."""
         current = await self.pool.fetchval(
@@ -370,6 +523,61 @@ class SandboxSession:
             WHERE tw_project_id = $2
         """, markdown, project_id)
         return f"Profile updated ({new_len} chars)"
+
+    async def _web_search(self, query: str, depth: str = "standard") -> dict:
+        """Search the web via Linkup API. Returns results + cost."""
+        if not settings.LINKUP_API_KEY:
+            return {"type": "web_search_result", "error": "LINKUP_API_KEY not configured"}
+        logger.info("Web search [session=%s]: %r (depth=%s)", self.session_id, query, depth)
+        async with httpx.AsyncClient(timeout=25) as client:
+            resp = await client.post(
+                "https://api.linkup.so/v1/search",
+                headers={"Authorization": f"Bearer {settings.LINKUP_API_KEY}"},
+                json={
+                    "q": query,
+                    "depth": depth,
+                    "outputType": "searchResults",
+                    "maxResults": 5,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        results = []
+        for r in data.get("results") or []:
+            if r.get("type") == "text":
+                results.append({
+                    "name": r.get("name", ""),
+                    "url": r.get("url", ""),
+                    "content": (r.get("content") or "")[:3000],
+                })
+        cost_key = "search_deep" if depth == "deep" else "search_standard"
+        return {
+            "type": "web_search_result",
+            "results": results,
+            "cost_usd": _LINKUP_COST_USD[cost_key],
+            "tool_name": "web_search",
+        }
+
+    async def _fetch_url(self, url: str) -> dict:
+        """Fetch a webpage via Linkup API. Returns markdown content + cost."""
+        if not settings.LINKUP_API_KEY:
+            return {"type": "fetch_url_result", "error": "LINKUP_API_KEY not configured"}
+        logger.info("Fetch URL [session=%s]: %s", self.session_id, url)
+        async with httpx.AsyncClient(timeout=25) as client:
+            resp = await client.post(
+                "https://api.linkup.so/v1/fetch",
+                headers={"Authorization": f"Bearer {settings.LINKUP_API_KEY}"},
+                json={"url": url, "renderJs": False},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        markdown = (data.get("markdown") or "")[:50000]
+        return {
+            "type": "fetch_url_result",
+            "markdown": markdown,
+            "cost_usd": _LINKUP_COST_USD["fetch"],
+            "tool_name": "fetch_url",
+        }
 
     async def _get_file_info(self, file_id: str) -> dict:
         """Get metadata for a file. Checks chat_files first, then falls back to files table."""

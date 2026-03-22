@@ -11,29 +11,13 @@ import asyncpg
 from . import settings
 from .sandbox import SandboxSession, resolve_images
 from . import storage as st
+from . import template_resolver as tr
 from .providers import get_provider
 
 logger = logging.getLogger("ibhelm.chat.llm")
 
 # Sandbox requirements (loaded once at import)
 _SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").read_text().strip() if (Path(__file__).resolve().parent.parent / "sandbox" / "requirements.txt").exists() else ""
-
-# Schema doc: loaded from DB function at runtime (cached 5 min)
-_schema_cache: dict = {"text": "", "ts": 0.0}
-
-
-async def get_cached_schema(pool: asyncpg.Pool) -> str:
-    import time
-    now = time.time()
-    if _schema_cache["text"] and now - _schema_cache["ts"] < 300:
-        return _schema_cache["text"]
-    try:
-        text = await pool.fetchval("SELECT get_agent_schema()") or ""
-        _schema_cache.update(text=text, ts=now)
-        return text
-    except Exception as e:
-        logger.warning("Failed to load agent schema from DB: %s", e)
-        return _schema_cache["text"]
 
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
@@ -101,21 +85,11 @@ def calculate_usage_cost_usd(model_config: dict | None, usage: dict | None) -> f
 
 TOOL_NAME = "run_python"
 TOOL_DESCRIPTION = (
-    "Execute Python in an isolated container with full library access.\n\n"
-    "Pre-loaded functions (no import needed):\n"
-    "- db(sql) -> list[dict]: Execute read-only SQL (SELECT/WITH)\n"
-    "- fmt(rows, max_rows=50, max_cell=80) -> str: Format as compact TOON table\n"
-    "- file_info(id) -> dict: File metadata {filename, size, mime_type, nas_path, project_name, extracted_text}\n"
-    "- file_text(id_or_path) -> str: Extract text (PDF, docx, pptx, xlsx, csv, txt). Accepts file UUID or /work/ path.\n"
-    "- file_image(id_or_path, page=None, max_dim=None): Queue image for you to see (vision models only). For PDFs: page number. max_dim resizes.\n"
-    "- describe_image(id_or_path, question=None, page=None): Send image to a vision model, get text description back. Use when you cannot view images directly. Pass a specific question for targeted analysis.\n"
-    "- download_file(content_hash) -> str: Download NAS file into /work/ by content_hash from DB\n"
-    "- download_craft_file(storage_path) -> str: Download Craft doc media (image/PDF/file) into /work/ by its storage path from craft-files bucket\n"
-    "- download_url(file_id) -> str: Get URL for user to click\n\n"
-    "Full Python: import anything, subprocess, os, open() all work.\n"
-    "/work/ is your workspace with conversation files pre-populated.\n"
-    "New files created in /work/ are automatically saved.\n"
-    "Variables persist across tool calls within this response."
+    "Execute Python in an isolated container. "
+    "Pre-loaded: db(sql), fmt(rows), file_text(id), file_image(id), describe_image(id), "
+    "download_file(hash), download_craft_file(path), download_url(id), web_search(query), fetch_url(url), "
+    "add_activity_entry(...), update_activity_entry(...), update_project_status(id, md), update_project_profile(id, md). "
+    "Full Python with all standard libraries. /work/ is your workspace. Always print() results."
 )
 TOOL_INPUT_SCHEMA = {
     "type": "object",
@@ -124,102 +98,6 @@ TOOL_INPUT_SCHEMA = {
     },
     "required": ["code"]
 }
-
-# ---------------------------------------------------------------------------
-# System prompt - STATIC part (cached by Anthropic)
-# ---------------------------------------------------------------------------
-
-STATIC_SYSTEM_PROMPT = """\
-You are an AI assistant for IBHelm, a data management system for an engineering office \
-(Ingenieurbüro) specializing in technische Gebäudeausrüstung (TGA / HVAC / building services engineering). \
-You have read-only access to the company's central database through Python code execution.
-
-The database aggregates data from three source systems:
-- **Teamwork**: Project management (tasks, projects, timelogs, tags)
-- **Missive**: Email communication (conversations, messages, contacts, attachments)
-- **Craft**: Documentation (documents with markdown content)
-Plus local files synced from the office NAS.
-
-## Behavior
-- Respond in the same language the user writes in.
-- Each user message ends with a system-injected timestamp (e.g. `[2026-03-04 14:30 UTC]`). This is NOT from the user — it provides temporal context. Do not mention it.
-- Be precise and helpful. Present query results clearly using Markdown (tables, lists, bold).
-- Always verify by querying rather than making assumptions. Don't guess IDs or dates.
-- When referencing specific items (tasks, emails, projects, documents, people), always include clickable links.
-- Be specific - reference actual task names, dates, assignees, and project names.
-- Don't make up information. If you don't know or can't find something, say so.
-- Keep responses focused and actionable. Avoid unnecessary pleasantries.
-- Variables persist across tool calls within one response - reuse them for multi-step analysis.
-
-## Previous conversations
-- while every new conversation starts with a fresh context, you have access to the previous conversations and can use them to understand the current context and the user's intent.
-- use this tool wisely if you think the user might be refrencing something from previous conversations or it could be helpful to look them up
-- use db function: search_chat_history for this purpose
-
-## Tool: run_python
-You have one tool: `run_python`. Execute Python code in an isolated container with full library access.
-
-### Pre-loaded Functions (always available, no import needed)
-- `db(sql)` - Execute read-only SQL (SELECT/WITH only). Returns list[dict].
-- `fmt(rows, max_rows=50, max_cell=80)` - Format rows as compact TOON table.
-- `file_info(id)` - Get metadata for a conversation file: {filename, size_bytes, mime_type, nas_path, project_name, extracted_text}.
-- `file_text(id_or_path)` - Extract text from a file (PDF, docx, pptx, xlsx, csv, plain text). Returns string. Accepts file UUID or /work/ path.
-- `file_image(id_or_path, page=None, max_dim=None)` - Queue an image for you to see (vision models only). For PDFs pass page number (1-indexed). max_dim resizes longest edge to save tokens. Accepts file UUID or local path.
-- `describe_image(id_or_path, question=None, page=None)` - Send image to a vision model and get a text description back. Use this if you cannot view images directly. Pass a specific question for targeted analysis (e.g. "what text is on this document?"), or None for a general description. Accepts file UUID or local /work/ path.
-- `download_file(content_hash)` - Download a NAS file into /work/ by its content_hash (from file_contents table). Returns local path.
-- `download_craft_file(storage_path)` - Download a Craft document media file (image, PDF, etc.) into /work/ by its storage path from the craft-files bucket. The storage path is the part after `craft-files/` in the URL. Returns local path.
-- `download_url(file_id)` - Get a download URL for a file the user can click.
-
-### Environment
-- Full Python with all standard libraries. `import` works normally.
-- Available packages: """ + _SANDBOX_REQUIREMENTS.replace('\n', ', ') + """.
-- `subprocess`, `os`, `pathlib`, `open()` all work.
-- /opt/sandbox/docs/ contains reference documentation. Read files there when you need details about the dashboard UI, system architecture, or deployment.
-- /work/ is your workspace. Files the user attached to the conversation are pre-populated there.
-- Any new files you save to /work/ are automatically uploaded and available to the user after execution.
-- Variables persist across tool calls within this response.
-
-### File IDs
-- Files attached to messages have UUIDs (use with file_info, file_text, file_image, download_url).
-- NAS files found via `v_project_files` have a `content_hash` column (use with download_file to pull into /work/).
-- `v_project_files` already includes extracted_text, storage_path, thumbnail_path — no extra JOINs needed.
-
-### Example
-```python
-tasks = db(\"\"\"
-    SELECT task_id, name, due_date, status, assignees, cost_groups
-    FROM v_project_tasks
-    WHERE project_id = 682843 AND status != 'completed'
-      AND due_date < NOW()
-    ORDER BY due_date
-\"\"\")
-print(fmt(tasks))
-```
-
-## Database Schema
-{agent_schema}
-
-For the complete schema (all tables, columns, FKs), call: `db("SELECT get_full_schema()")`
-For a specific schema: `db("SELECT get_full_schema('missive')")`
-
-## Generating Links
-When you mention specific tasks, emails, projects, or documents, always include clickable Markdown links.
-
-- **Teamwork task**: `[Task Name](https://ibhelm.teamwork.com/#/tasks/{task_id})` — `v_project_tasks` has a `url` column
-- **Teamwork project**: `[Project Name](https://ibhelm.teamwork.com/app/projects/{project_id})`
-- **Missive conversation**: `[Subject](https://mail.missiveapp.com/#inbox/conversations/{conversation_id})` — `v_project_emails` has a `missive_url` column
-- **Craft document**: `[Title](craftdocs://open?blockId={document_id})` — `v_project_craft_docs` has a `craft_url` column
-
-## Row Level Security (RLS)
-The database enforces row-level security. Email visibility is automatically filtered \
-by the current user's access. This is normal — do not treat missing results as an error.
-
-## Limitations
-- The database is READ-ONLY. No INSERT, UPDATE, or DELETE.
-- If the user wants to edit something, they must do it in the source tool (Teamwork, Missive, Craft). Changes sync to the database within a few minutes.
-- You cannot send notifications, schedule tasks, or access external websites.
-- Long print output is automatically truncated. If that happens, use targeted slicing on your variables to inspect specific parts.
-- The sandbox has no internet access. All external data must come through db() or pre-populated files."""
 
 # ---------------------------------------------------------------------------
 # Model config resolution (cached from DB)
@@ -258,36 +136,12 @@ def invalidate_model_cache():
     global _model_configs
     _model_configs = None
 
-# ---------------------------------------------------------------------------
-# Dynamic context builder
-# ---------------------------------------------------------------------------
-
-
-async def build_dynamic_context(pool: asyncpg.Pool, user_email: str | None) -> str:
-    parts = [f"## Current Context\n- **User**: {user_email or 'unknown'}"]
-    try:
-        rows = await pool.fetch(
-            "SELECT id, name FROM teamwork.projects WHERE status = 'active' ORDER BY name"
-        )
-        if rows:
-            parts.append("\n## Active Projects")
-            parts.append("Users often use abbreviations. Match against this list:")
-            for r in rows:
-                parts.append(f"- {r['name']} (id: {r['id']})")
-    except Exception as e:
-        logger.warning("Failed to fetch projects for context: %s", e)
-    return "\n".join(parts)
-
-
-async def _build_system_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
-    schema = await get_cached_schema(pool)
-    dynamic = await build_dynamic_context(pool, user_email)
-    return STATIC_SYSTEM_PROMPT.replace("{agent_schema}", schema) + "\n\n" + dynamic
-
-
 async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
-    """Build the full system prompt to snapshot on a new chat session."""
-    return await _build_system_prompt(pool, user_email)
+    """Build the full system prompt from the chat.system_prompt template."""
+    return await tr.resolve(pool, "chat.system_prompt", {
+        "user_email": user_email or "unknown",
+        "sandbox_requirements": _SANDBOX_REQUIREMENTS.replace('\n', ', '),
+    })
 
 # ---------------------------------------------------------------------------
 # Streaming chat response with shared tool loop
@@ -454,7 +308,8 @@ async def stream_chat_response(
                     parts.append(result["stdout"])
                 if result.get("result") is not None:
                     parts.append(json.dumps(result["result"], ensure_ascii=False, default=str))
-                output = "\n".join(parts) if parts else "(no output)"
+                output = "\n".join(parts) if parts else \
+                    "(no output — your code ran but printed nothing. Use print() to see db() results or function return values.)"
                 tc_record["result"] = output
                 yield {"type": "tool_result", "id": tc_id, "result": output}
 
@@ -545,7 +400,7 @@ async def stream_chat_response(
 
 async def generate_title(content: str, pool: asyncpg.Pool) -> str:
     """Generate a short title for a chat session from the first message."""
-    prompt = f"Generate a short title (2-5 words) for this chat message. Reply with ONLY the title — no alternatives, no explanations, no quotes, no period.\n\n{content[:500]}"
+    prompt = await tr.resolve(pool, "chat.title_generation", {"message_content": content[:500]})
 
     try:
         title_model_id = settings.TITLE_MODEL

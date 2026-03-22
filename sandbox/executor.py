@@ -168,6 +168,8 @@ def _build_env(bridge: BridgeClient) -> dict:
         "download_file": bridge.download_file,
         "download_craft_file": bridge.download_craft_file,
         "download_url": bridge.download_url,
+        "web_search": bridge.web_search,
+        "fetch_url": bridge.fetch_url,
         "add_activity_entry": bridge.add_activity_entry,
         "update_project_status": bridge.update_project_status,
         "update_project_profile": bridge.update_project_profile,
@@ -183,40 +185,11 @@ def _run_code(code: str, env: dict) -> dict:
     try:
         exec(compile(code, "<code>", "exec"), env)
 
-        last_val = None
-        stripped = code.strip()
-        try:
-            last_val = eval(compile(stripped, "<code>", "eval"), env)
-        except (SyntaxError, TypeError):
-            lines = stripped.split("\n")
-            if lines:
-                last = lines[-1].strip()
-                skip = ("#", "import", "from", "def", "class", "if", "for",
-                        "while", "try", "with", "return", "raise", "assert",
-                        "pass", "break", "continue", "print(", "print (")
-                if last and not any(last.startswith(p) for p in skip):
-                    if "=" not in last or last.count("=") == last.count("=="):
-                        try:
-                            last_val = eval(last, env)
-                        except Exception:
-                            pass
-
         output = captured.getvalue()
         if len(output) > MAX_OUTPUT:
             output = output[:MAX_OUTPUT] + f"\n... (truncated, {len(output)} total chars)"
 
-        result = last_val
-        if result is not None:
-            try:
-                if hasattr(result, "isoformat"):
-                    result = result.isoformat()
-                elif isinstance(result, (set, frozenset)):
-                    result = list(result)
-                json.dumps(result)
-            except (TypeError, ValueError):
-                result = str(result)
-
-        return {"result": result, "output": output or None, "error": None}
+        return {"result": None, "output": output or None, "error": None}
     except Exception as e:
         output = captured.getvalue()
         return {"result": None, "output": output or None, "error": f"{type(e).__name__}: {e}"}

@@ -6,6 +6,7 @@ sandbox code execution is single-threaded.
 """
 
 import json
+import re
 import struct
 
 _HEADER_FMT = "!I"
@@ -37,6 +38,19 @@ def _recv(sock) -> dict:
     return json.loads(data.decode("utf-8"))
 
 
+def _normalize_placeholders(sql: str, params: tuple) -> tuple[str, tuple]:
+    """Convert psycopg2-style %s placeholders to asyncpg-style $N."""
+    if '%s' not in sql:
+        return sql, params
+    counter = 0
+    def _replace(m):
+        nonlocal counter
+        counter += 1
+        return f'${counter}'
+    converted = re.sub(r'(?<!%)%s', _replace, sql).replace('%%', '%')
+    return converted, params
+
+
 class BridgeClient:
     """Proxy to chat service for DB/file operations. Uses shared socket."""
 
@@ -63,9 +77,14 @@ class BridgeClient:
         self._tool_costs = []
         return costs
 
-    def db(self, sql=None, **kwargs) -> list[dict]:
+    def db(self, sql=None, *params, **kwargs) -> list[dict]:
         sql = sql or kwargs.get("query") or kwargs.get("sql")
-        resp = self._request("db_query", {"sql": sql})
+        if params:
+            sql, params = _normalize_placeholders(sql, params)
+        payload = {"sql": sql}
+        if params:
+            payload["params"] = list(params)
+        resp = self._request("db_query", payload)
         if resp.get("error"):
             raise RuntimeError(resp["error"])
         return resp["rows"]
@@ -121,6 +140,25 @@ class BridgeClient:
             raise RuntimeError(resp["error"])
         return resp["id"]
 
+    def update_activity_entry(self, entry_id, summary=None, category=None,
+                              kgr_codes=None, involved_persons=None,
+                              append_source_event_ids=None, **kwargs) -> str:
+        payload = {"entry_id": entry_id}
+        if summary is not None:
+            payload["summary"] = summary
+        if category is not None:
+            payload["category"] = category
+        if kgr_codes is not None:
+            payload["kgr_codes"] = kgr_codes
+        if involved_persons is not None:
+            payload["involved_persons"] = involved_persons
+        if append_source_event_ids:
+            payload["append_source_event_ids"] = append_source_event_ids
+        resp = self._request("update_activity_entry", payload)
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp.get("message", "ok")
+
     def update_project_status(self, project_id, markdown) -> str:
         resp = self._request("update_project_status", {"project_id": project_id, "markdown": markdown})
         if resp.get("error"):
@@ -132,6 +170,26 @@ class BridgeClient:
         if resp.get("error"):
             raise RuntimeError(resp["error"])
         return resp.get("message", "ok")
+
+    def web_search(self, query=None, depth="standard", **kwargs) -> list[dict]:
+        """Search the web. Returns list of {name, url, content}."""
+        query = query or kwargs.get("q")
+        if not query:
+            raise ValueError("web_search requires a query string")
+        resp = self._request("web_search", {"query": query, "depth": depth})
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp["results"]
+
+    def fetch_url(self, url=None, **kwargs) -> str:
+        """Fetch a webpage and return its markdown content."""
+        url = url or kwargs.get("href")
+        if not url:
+            raise ValueError("fetch_url requires a URL")
+        resp = self._request("fetch_url", {"url": url})
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp["markdown"]
 
     def describe_image(self, ref=None, question=None, page=None, **kwargs) -> str:
         ref = ref or kwargs.get("id_or_path") or kwargs.get("id") or kwargs.get("path")
