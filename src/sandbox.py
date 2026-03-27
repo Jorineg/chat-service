@@ -856,11 +856,11 @@ async def _call_vision_model(image_data: bytes, media_type: str, question: str |
                              pool: asyncpg.Pool) -> dict:
     """Call the vision fallback model to describe an image."""
     import base64
-    from .llm import calculate_usage_cost_usd, normalize_usage, resolve_model
+    from .llm import calculate_usage_cost_usd, normalize_usage, resolve_model, get_app_setting
 
-    vision_model_id = settings.VISION_FALLBACK_MODEL
+    vision_model_id = await get_app_setting(pool, "vision_fallback_model_id")
     if not vision_model_id:
-        raise RuntimeError("No VISION_FALLBACK_MODEL configured")
+        raise RuntimeError("No vision fallback model configured in settings")
 
     model_config = await resolve_model(vision_model_id, pool)
     if not model_config.get("supports_vision"):

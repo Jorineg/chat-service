@@ -2,7 +2,7 @@
 
 Resolves three directive types in order:
 1. {{include:template_id}} — recursive composition (cycle detection, max depth 10)
-2. {runtime_var} — replaced from caller-provided dict
+2. ${runtime_var} — replaced from caller-provided dict
 3. {{sql:query |||prefix|||fallback}} — execute read-only SQL, insert result
 """
 
@@ -19,6 +19,8 @@ logger = logging.getLogger("ibhelm.chat.resolver")
 
 _INCLUDE_RE = re.compile(r'\{\{include:([^}]+)\}\}')
 _SQL_RE = re.compile(r'\{\{sql:(.*?)\}\}', re.DOTALL)
+_ESC_BRACE = '\x00ESC_BRACE\x00'
+_ESC_DOLLAR = '\x00ESC_DOLLAR\x00'
 
 # ---------------------------------------------------------------------------
 # Cache: all templates loaded in bulk, invalidated via LISTEN/NOTIFY
@@ -100,11 +102,12 @@ async def resolve(
     if content is None:
         return f'{{{{error: template "{template_id}" not found}}}}'
 
+    content = _escape(content)
     content = _resolve_includes(content, set())
     if runtime_vars:
         content = _resolve_vars(content, runtime_vars)
     content = await _resolve_sql(pool, content)
-    return content
+    return _unescape(content)
 
 
 async def resolve_raw(
@@ -114,11 +117,22 @@ async def resolve_raw(
 ) -> str:
     """Resolve directives in arbitrary text (not from a stored template)."""
     await _ensure_cache(pool)
+    content = _escape(content)
     content = _resolve_includes(content, set())
     if runtime_vars:
         content = _resolve_vars(content, runtime_vars)
     content = await _resolve_sql(pool, content)
-    return content
+    return _unescape(content)
+
+
+def _escape(content: str) -> str:
+    """Replace \\{{ and \\${ with placeholders to protect from resolution."""
+    return content.replace('\\{{', _ESC_BRACE).replace('\\${', _ESC_DOLLAR)
+
+
+def _unescape(content: str) -> str:
+    """Restore escaped directives to their literal form."""
+    return content.replace(_ESC_BRACE, '{{').replace(_ESC_DOLLAR, '${')
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +156,12 @@ def _resolve_includes(content: str, visited: set[str], depth: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: {runtime_var}
+# Step 2: ${runtime_var}
 # ---------------------------------------------------------------------------
 
 def _resolve_vars(content: str, variables: dict[str, str]) -> str:
     for key, val in variables.items():
-        content = content.replace(f'{{{key}}}', str(val))
+        content = content.replace(f'${{{key}}}', str(val))
     return content
 
 

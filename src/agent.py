@@ -18,7 +18,7 @@ import asyncpg
 
 from . import settings
 from . import template_resolver as tr
-from .llm import stream_chat_response, resolve_model
+from .llm import stream_chat_response, resolve_model, get_app_setting
 from .sandbox import SandboxSession
 
 logger = logging.getLogger("ibhelm.chat.agent")
@@ -115,7 +115,8 @@ def _compute_diff(old_text: str | None, new_text: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 async def _resolve_agent_model(pool: asyncpg.Pool) -> dict:
-    return await resolve_model(settings.AGENT_MODEL, pool)
+    agent_model_id = await get_app_setting(pool, "agent_model_id")
+    return await resolve_model(agent_model_id, pool)
 
 
 async def run_agent_turn(

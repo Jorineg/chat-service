@@ -16,7 +16,7 @@ from . import settings, storage
 from . import template_resolver as tr
 from .auth import get_current_user, require_admin
 from .database import get_pool, close_pool
-from .llm import get_model_configs, invalidate_model_cache, resolve_model, build_session_prompt
+from .llm import get_model_configs, get_app_setting, resolve_model, build_session_prompt
 from .agent import AGENT_USER_ID
 from . import tasks
 
@@ -75,9 +75,12 @@ async def health():
 async def list_models(user: dict = Depends(get_current_user)):
     """Return available models from app_settings.body->'chat_models'."""
     pool = await get_pool()
-    invalidate_model_cache()
     configs = await get_model_configs(pool)
-    return [m for m in configs if not m.get("hidden")]
+    default_id = await get_app_setting(pool, "default_chat_model_id")
+    return [
+        {**m, "default": m["id"] == default_id}
+        for m in configs if not m.get("hidden")
+    ]
 
 
 # =============================================================================

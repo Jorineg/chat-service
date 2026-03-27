@@ -100,24 +100,23 @@ TOOL_INPUT_SCHEMA = {
 }
 
 # ---------------------------------------------------------------------------
-# Model config resolution (cached from DB)
+# Model config resolution (always reads from DB, no caching)
 # ---------------------------------------------------------------------------
 
-_model_configs: list[dict] | None = None
+
+async def get_app_setting(pool: asyncpg.Pool, key: str) -> str | None:
+    """Read a single key from app_settings.body."""
+    return await pool.fetchval("SELECT body->>$1 FROM app_settings LIMIT 1", key)
 
 
 async def get_model_configs(pool: asyncpg.Pool) -> list[dict]:
-    """Load and cache model configs from app_settings."""
-    global _model_configs
-    if _model_configs is not None:
-        return _model_configs
-    row = await pool.fetchrow("SELECT body->>'chat_models' as models FROM app_settings LIMIT 1")
-    if row and row["models"]:
-        _model_configs = json.loads(row["models"])
-    else:
-        _model_configs = [{"id": settings.CLAUDE_MODEL, "provider": "anthropic",
-                           "name": "Claude Sonnet 4", "default": True}]
-    return _model_configs
+    """Load model configs from app_settings."""
+    raw = await get_app_setting(pool, "chat_models")
+    if raw:
+        models = json.loads(raw)
+        if models:
+            return models
+    return [{"id": settings.CLAUDE_MODEL, "provider": "anthropic", "name": "Claude Sonnet 4"}]
 
 
 async def resolve_model(model_id: str | None, pool: asyncpg.Pool) -> dict:
@@ -127,14 +126,12 @@ async def resolve_model(model_id: str | None, pool: asyncpg.Pool) -> dict:
         match = next((m for m in configs if m["id"] == model_id), None)
         if match:
             return match
-    default = next((m for m in configs if m.get("default")), configs[0])
-    return default
-
-
-def invalidate_model_cache():
-    """Call when app_settings might have changed."""
-    global _model_configs
-    _model_configs = None
+    default_id = await get_app_setting(pool, "default_chat_model_id")
+    if default_id:
+        match = next((m for m in configs if m["id"] == default_id), None)
+        if match:
+            return match
+    return configs[0]
 
 async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
     """Build the full system prompt from the chat.system_prompt template."""
@@ -403,11 +400,8 @@ async def generate_title(content: str, pool: asyncpg.Pool) -> str:
     prompt = await tr.resolve(pool, "chat.title_generation", {"message_content": content[:500]})
 
     try:
-        title_model_id = settings.TITLE_MODEL
-        if title_model_id:
-            model_config = await resolve_model(title_model_id, pool)
-        else:
-            model_config = await resolve_model(None, pool)
+        title_model_id = await get_app_setting(pool, "title_model_id")
+        model_config = await resolve_model(title_model_id, pool)
 
         provider = get_provider(model_config)
         max_tokens = 1000 if model_config.get("provider") != "anthropic" else 30

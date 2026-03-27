@@ -14,7 +14,7 @@ def get_provider(model_config: dict) -> LLMProvider:
     provider_type = model_config.get("provider", "anthropic")
     if provider_type == "anthropic":
         return AnthropicProvider(api_key=settings.ANTHROPIC_API_KEY)
-    if provider_type == "nebius":
+    if provider_type == "openai_compat":
         return OpenAICompatProvider(
             api_key=settings.NEBIUS_API_KEY,
             base_url=model_config.get("base_url", "https://api.tokenfactory.nebius.com/v1/"),
