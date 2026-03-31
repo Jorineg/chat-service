@@ -1,11 +1,13 @@
 """Anthropic Claude provider."""
 
+import asyncio
 import logging
 from typing import Any, AsyncGenerator
 
 import anthropic
 
 from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
+from ..api_log import log_request, log_response
 
 logger = logging.getLogger("ibhelm.chat.provider.anthropic")
 
@@ -16,11 +18,8 @@ class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0)
 
-    def build_system_prompt(self, static: str, dynamic: str) -> list[dict]:
-        return [
-            {"type": "text", "text": static, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-            {"type": "text", "text": dynamic},
-        ]
+    def build_system_prompt(self, text: str) -> list[dict]:
+        return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
     def build_tool_definition(self, name: str, description: str, input_schema: dict) -> dict:
         return {"name": name, "description": description, "input_schema": input_schema}
@@ -168,25 +167,46 @@ class AnthropicProvider(LLMProvider):
             "system": system,
             "tools": tools,
             "messages": messages,
+            "cache_control": {"type": "ephemeral"},
         }
         if thinking_config:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_config["budget_tokens"]}
 
-        try:
-            async with self.client.messages.stream(**kwargs) as stream:
-                async for event in stream:
-                    if event.type == "content_block_delta":
-                        if hasattr(event.delta, 'text'):
-                            yield {"type": "text", "content": event.delta.text}
-                        elif hasattr(event.delta, 'thinking'):
-                            yield {"type": "thinking", "content": event.delta.thinking}
+        log_request("anthropic", model_id, messages, system=system, tools=tools)
 
-                response = await stream.get_final_message()
-        except anthropic.APIError as e:
-            logger.error("Anthropic API error: %s", e)
-            yield {"type": "turn_end", "stop_reason": "error", "error": str(e),
-                   "tool_calls": [], "usage": _empty_usage()}
-            return
+        max_retries = 5
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.client.messages.stream(**kwargs) as stream:
+                    async for event in stream:
+                        if event.type == "content_block_delta":
+                            if hasattr(event.delta, 'text'):
+                                yield {"type": "text", "content": event.delta.text}
+                            elif hasattr(event.delta, 'thinking'):
+                                yield {"type": "thinking", "content": event.delta.thinking}
+
+                    response = await stream.get_final_message()
+                break
+            except anthropic.RateLimitError as e:
+                retry_after = float(e.response.headers.get("retry-after", 30))
+                if attempt < max_retries:
+                    logger.warning("Rate limited (attempt %d/%d), retrying in %.0fs",
+                                   attempt + 1, max_retries, retry_after)
+                    yield {"type": "rate_limit", "retry_after": retry_after, "attempt": attempt + 1,
+                           "max_retries": max_retries}
+                    await asyncio.sleep(retry_after)
+                    continue
+                logger.error("Rate limited after %d retries: %s", max_retries, e)
+                yield {"type": "turn_end", "stop_reason": "error",
+                       "error": f"Rate limited after {max_retries} retries: {e}",
+                       "tool_calls": [], "usage": _empty_usage()}
+                return
+            except anthropic.APIError as e:
+                logger.error("Anthropic API error: %s", e)
+                log_response("anthropic", model_id, error=str(e))
+                yield {"type": "turn_end", "stop_reason": "error", "error": str(e),
+                       "tool_calls": [], "usage": _empty_usage()}
+                return
 
         tool_calls = [
             {"id": b.id, "name": b.name, "input": b.input}
@@ -201,6 +221,8 @@ class AnthropicProvider(LLMProvider):
         }
 
         stop = "tool_use" if response.stop_reason == "tool_use" else "end_turn"
+        log_response("anthropic", model_id, tool_calls=tool_calls, usage=usage,
+                     stop_reason=response.stop_reason)
         yield {"type": "turn_end", "stop_reason": stop, "tool_calls": tool_calls, "usage": usage}
 
     async def generate_simple(self, model_id: str, prompt: str, max_tokens: int) -> str:

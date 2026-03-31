@@ -82,6 +82,7 @@ async def run_generation(
     session_title: str | None,
     user_id: str | None = None,
     system_prompt: str | None = None,
+    is_admin: bool = False,
 ):
     """Run LLM generation as an independent task. Pushes events + writes to DB incrementally."""
     from .llm import stream_chat_response, generate_title
@@ -94,6 +95,8 @@ async def run_generation(
     async def _finalize(status: str, error: str | None = None, usage: dict | None = None):
         """Single exit point: push 'done' event + write same state to DB."""
         metadata = {"model": active_model, **(usage or {})}
+        if error:
+            metadata["error"] = error
         done_event: dict = {
             "type": "done", "status": status,
             "content": full_text, "blocks": all_blocks or None,
@@ -135,7 +138,7 @@ async def run_generation(
         asyncio.create_task(_gen_title())
 
     try:
-        sandbox = SandboxSession(pool, user_email, gen.session_id, user_id=user_id, model_id=model_config["id"])
+        sandbox = SandboxSession(pool, user_email, gen.session_id, user_id=user_id, model_id=model_config["id"], is_admin=is_admin)
         conversation_files = await get_session_files(pool, gen.session_id)
         await sandbox.start(conversation_files)
 

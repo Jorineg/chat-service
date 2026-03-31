@@ -73,7 +73,7 @@ class LLMProvider(ABC):
     """Abstract LLM provider. Subclasses handle Anthropic, OpenAI-compatible APIs, etc."""
 
     @abstractmethod
-    def build_system_prompt(self, static: str, dynamic: str) -> Any:
+    def build_system_prompt(self, text: str) -> Any:
         """Build provider-specific system prompt representation."""
 
     @abstractmethod

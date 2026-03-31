@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 poppler-utils libheif1 && \
+    libgl1 libglib2.0-0 poppler-utils libheif1 \
+    ffmpeg libsndfile1 \
+    libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
+    fonts-liberation fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt

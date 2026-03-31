@@ -26,8 +26,10 @@ logger = logging.getLogger("ibhelm.chat.agent")
 AGENT_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 _SOURCE_CONTENT_QUERIES = {
-    "teamwork.tasks": "SELECT description FROM teamwork.tasks WHERE id = $1::int",
+    "teamwork.tasks": "SELECT description FROM teamwork.tasks WHERE id = $1::text::int",
     "craft_documents": "SELECT markdown_content FROM craft_documents WHERE id = $1",
+    "project_extensions:profile": "SELECT profile_markdown FROM project_extensions WHERE tw_project_id = $1::text::int",
+    "project_extensions:status": "SELECT status_markdown FROM project_extensions WHERE tw_project_id = $1::text::int",
 }
 
 
@@ -54,7 +56,7 @@ async def process_pending_diffs(pool: asyncpg.Pool):
     Only the last event per source needs a live DB fetch.
     """
     events = await pool.fetch(
-        "SELECT id, source_table, source_id, old_content "
+        "SELECT id, source_table, source_id, old_content, details "
         "FROM project_event_log "
         "WHERE old_content IS NOT NULL AND NOT processed_by_diff "
         "ORDER BY id"
@@ -74,7 +76,8 @@ async def process_pending_diffs(pool: asyncpg.Pool):
                 if i + 1 < len(chain):
                     new_content = chain[i + 1]["old_content"]
                 else:
-                    new_content = await _fetch_current_content(pool, source_table, source_id)
+                    details = json.loads(event["details"]) if isinstance(event["details"], str) else event["details"]
+                    new_content = await _fetch_current_content(pool, source_table, source_id, details)
                 diff = _compute_diff(event["old_content"], new_content)
                 await pool.execute(
                     "UPDATE project_event_log "
@@ -93,18 +96,23 @@ async def process_pending_diffs(pool: asyncpg.Pool):
 
 
 async def _fetch_current_content(
-    pool: asyncpg.Pool, source_table: str, source_id: str
+    pool: asyncpg.Pool, source_table: str, source_id: str,
+    details: dict | None = None,
 ) -> str | None:
-    query = _SOURCE_CONTENT_QUERIES.get(source_table)
+    key = source_table
+    if source_table == "project_extensions" and details:
+        key = f"project_extensions:{details.get('field', '')}"
+    query = _SOURCE_CONTENT_QUERIES.get(key)
     if not query:
         return None
     return await pool.fetchval(query, source_id)
 
 
 def _compute_diff(old_text: str | None, new_text: str | None) -> str:
-    result = "".join(difflib.unified_diff(
-        (old_text or "").splitlines(keepends=True),
-        (new_text or "").splitlines(keepends=True),
+    result = "\n".join(difflib.unified_diff(
+        (old_text or "").splitlines(),
+        (new_text or "").splitlines(),
+        lineterm="",
         n=3,
     ))
     return result or "(no changes)"
@@ -176,9 +184,10 @@ async def run_agent_turn(
                 all_blocks = event.get("blocks") or []
                 usage = event.get("metadata") or {}
             elif etype == "error":
+                err_meta = {"model": model_config["id"], "error": event.get("message")}
                 await pool.execute(
-                    "UPDATE chat_messages SET status='error', content=$1 WHERE id=$2",
-                    event.get("message"), asst_msg_id,
+                    "UPDATE chat_messages SET status='error', metadata=$1 WHERE id=$2",
+                    json.dumps(err_meta), asst_msg_id,
                 )
                 raise RuntimeError(event.get("message"))
 
@@ -227,9 +236,10 @@ async def run_agent_turn(
                         all_blocks = event.get("blocks") or []
                         usage = event.get("metadata") or {}
                     elif etype == "error":
+                        err_meta = {"model": model_config["id"], "error": event.get("message")}
                         await pool.execute(
-                            "UPDATE chat_messages SET status='error', content=$1 WHERE id=$2",
-                            event.get("message"), nudge_asst_id,
+                            "UPDATE chat_messages SET status='error', metadata=$1 WHERE id=$2",
+                            json.dumps(err_meta), nudge_asst_id,
                         )
                         break
 

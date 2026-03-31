@@ -17,7 +17,7 @@ import sys
 from io import StringIO
 from pathlib import Path
 
-from bridge_client import BridgeClient, fmt, _send, _recv
+from bridge_client import BridgeClient, DbResult, _send, _recv
 
 try:
     from pillow_heif import register_heif_opener
@@ -160,7 +160,6 @@ def _build_env(bridge: BridgeClient) -> dict:
 
     return {
         "db": bridge.db,
-        "fmt": fmt,
         "file_info": bridge.file_info,
         "file_text": file_text,
         "file_image": file_image,
@@ -171,10 +170,21 @@ def _build_env(bridge: BridgeClient) -> dict:
         "web_search": bridge.web_search,
         "fetch_url": bridge.fetch_url,
         "add_activity_entry": bridge.add_activity_entry,
+        "update_activity_entry": bridge.update_activity_entry,
         "update_project_status": bridge.update_project_status,
         "update_project_profile": bridge.update_project_profile,
+        "create_prompt": bridge.create_prompt,
+        "update_prompt": bridge.update_prompt,
+        "delete_prompt": bridge.delete_prompt,
         "_pending_images": pending_images,
     }
+
+
+def _tag_dbresult_vars(env: dict):
+    """Set _var_name on DbResult instances so pagination hints reference the variable."""
+    for name, val in env.items():
+        if isinstance(val, DbResult) and not name.startswith('_'):
+            val._var_name = name
 
 
 def _run_code(code: str, env: dict) -> dict:
@@ -184,6 +194,7 @@ def _run_code(code: str, env: dict) -> dict:
     sys.stdout = captured
     try:
         exec(compile(code, "<code>", "exec"), env)
+        _tag_dbresult_vars(env)
 
         output = captured.getvalue()
         if len(output) > MAX_OUTPUT:

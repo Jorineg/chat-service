@@ -21,3 +21,10 @@ pyyaml
 scipy
 xmltodict
 pytz
+odfpy
+pydub
+librosa
+soundfile
+mutagen
+reportlab
+pikepdf

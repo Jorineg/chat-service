@@ -21,6 +21,7 @@ _SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "r
 
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
+_MENTION_RE = re.compile(r'@\[([^\]]+)\]\((\d+)\)')
 _USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -84,12 +85,10 @@ def calculate_usage_cost_usd(model_config: dict | None, usage: dict | None) -> f
 # ---------------------------------------------------------------------------
 
 TOOL_NAME = "run_python"
+# this tool description is short on purpose...
+# more details are in system prompt(s) and skills that live in db: public.prompt_templates
 TOOL_DESCRIPTION = (
     "Execute Python in an isolated container. "
-    "Pre-loaded: db(sql), fmt(rows), file_text(id), file_image(id), describe_image(id), "
-    "download_file(hash), download_craft_file(path), download_url(id), web_search(query), fetch_url(url), "
-    "add_activity_entry(...), update_activity_entry(...), update_project_status(id, md), update_project_profile(id, md). "
-    "Full Python with all standard libraries. /work/ is your workspace. Always print() results."
 )
 TOOL_INPUT_SCHEMA = {
     "type": "object",
@@ -141,6 +140,56 @@ async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> st
     })
 
 # ---------------------------------------------------------------------------
+# Project mention enrichment
+# ---------------------------------------------------------------------------
+
+
+async def enrich_project_mentions(pool: asyncpg.Pool, messages: list[dict]) -> None:
+    """Find @[Name](id) mentions in user messages and append project context."""
+    all_ids: set[int] = set()
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        for match in _MENTION_RE.finditer(msg.get("content") or ""):
+            try:
+                all_ids.add(int(match.group(2)))
+            except ValueError:
+                pass
+    if not all_ids:
+        return
+
+    rows = await pool.fetch(
+        "SELECT p_id AS id, get_project_context(p_id) AS context "
+        "FROM unnest($1::int[]) AS p_id",
+        list(all_ids),
+    )
+    contexts = {r["id"]: r["context"] for r in rows}
+
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        mentions = _MENTION_RE.findall(msg.get("content") or "")
+        if not mentions:
+            continue
+        sections = []
+        for name, id_str in mentions:
+            pid = int(id_str)
+            ctx = contexts.get(pid)
+            if ctx:
+                sections.append(
+                    f"\n[Auto-injected: get_project_context({pid}) — "
+                    f"full output of function. Do not call again for this project.]\n{ctx}"
+                )
+            else:
+                sections.append(
+                    f"\n[Project id={pid} (\"{name}\") not found — the user may have "
+                    f"meant a different project. Try to identify the correct project "
+                    f"and use get_project_context via run_python if needed.]"
+                )
+        msg["content"] = msg["content"] + "\n" + "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Streaming chat response with shared tool loop
 # ---------------------------------------------------------------------------
 
@@ -171,14 +220,13 @@ async def stream_chat_response(
 
     yield {"type": "model_resolved", "model": active_model}
 
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     if not system_prompt:
-        system_prompt = await _build_system_prompt(pool, user_email)
+        system_prompt = await build_session_prompt(pool, user_email)
     if model_config.get("system_prompt_addition"):
         system_prompt += "\n\n" + model_config["system_prompt_addition"]
-    system = provider.build_system_prompt(system_prompt, f"Current time: {ts}")
+    system = provider.build_system_prompt(system_prompt)
     tools = [provider.build_tool_definition(TOOL_NAME, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA)]
+    await enrich_project_mentions(pool, messages)
     api_messages = provider.build_api_messages(messages)
 
     thinking_config = None
@@ -194,6 +242,8 @@ async def stream_chat_response(
     subcall_index = 0
 
     def _append_block(btype: str, text: str):
+        if btype == "text" and not text.strip() and all_blocks and all_blocks[-1].get("type") == "tool_call":
+            return
         if all_blocks and all_blocks[-1]["type"] == btype:
             all_blocks[-1]["text"] += text
         else:
@@ -217,6 +267,9 @@ async def stream_chat_response(
             elif etype == "thinking":
                 _append_block("thinking", event["content"])
                 yield {"type": "thinking", "content": event["content"]}
+
+            elif etype == "rate_limit":
+                yield event
 
             elif etype == "turn_end":
                 if event.get("error"):

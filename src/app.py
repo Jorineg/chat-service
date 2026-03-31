@@ -13,7 +13,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import settings, storage
-from . import template_resolver as tr
 from .auth import get_current_user, require_admin
 from .database import get_pool, close_pool
 from .llm import get_model_configs, get_app_setting, resolve_model, build_session_prompt
@@ -30,7 +29,6 @@ async def lifespan(app: FastAPI):
     logger.info("Chat Service starting on port %s", settings.PORT)
 
     pool = await get_pool()
-    await tr.start_listener(pool)
 
     agent_task = None
     if settings.AGENT_ENABLED:
@@ -332,7 +330,7 @@ async def _cancel_active(session_id: str):
 async def _start_generation(
     pool, session_id: str, user_email: str | None, user_id: str,
     user_content: str, session_title: str | None, model_id: str | None,
-    system_prompt: str | None = None,
+    system_prompt: str | None = None, is_admin: bool = False,
 ) -> tuple[str, tasks.GenerationTask]:
     """Shared generation setup. Call AFTER user message is ready in DB.
 
@@ -365,7 +363,7 @@ async def _start_generation(
     gen.task = asyncio.create_task(tasks.run_generation(
         gen, history, pool, user_email, model_config,
         user_content, session_title, user_id=user_id,
-        system_prompt=system_prompt,
+        system_prompt=system_prompt, is_admin=is_admin,
     ))
     tasks.register(session_id, gen)
 
@@ -439,10 +437,11 @@ async def send_message(
             "bucket": bucket, "origin": origin, "size_bytes": len(data), "mime_type": mime,
         })
 
+    is_admin = (user.get("app_metadata") or {}).get("role") == "admin"
     asst_msg_id, gen = await _start_generation(
         pool, session_id, user_email, str(user_id),
         content, session["title"], model,
-        system_prompt=session["system_prompt"],
+        system_prompt=session["system_prompt"], is_admin=is_admin,
     )
 
     initial = [{"type": "user_message_id", "id": user_msg_id}]
@@ -495,10 +494,11 @@ async def regenerate(session_id: str, body: RegenerateRequest, user: dict = Depe
         session_id, user_msg["created_at"]
     )
 
+    is_admin = (user.get("app_metadata") or {}).get("role") == "admin"
     asst_msg_id, gen = await _start_generation(
         pool, session_id, user_email, str(user_id),
         user_msg["content"], session["title"], body.model,
-        system_prompt=session["system_prompt"],
+        system_prompt=session["system_prompt"], is_admin=is_admin,
     )
     return _sse_response({"type": "assistant_message_id", "id": asst_msg_id}, gen=gen)
 
@@ -713,7 +713,7 @@ async def send_agent_message(
     asst_msg_id, gen = await _start_generation(
         pool, session_id, user_email, str(user["sub"]),
         prefixed, session["title"], model,
-        system_prompt=session["system_prompt"],
+        system_prompt=session["system_prompt"], is_admin=True,
     )
 
     return _sse_response(

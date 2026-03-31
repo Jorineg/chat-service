@@ -97,13 +97,14 @@ class SandboxSession:
 
     def __init__(self, pool: asyncpg.Pool, user_email: str | None, session_id: str,
                  user_id: str | None = None, model_id: str | None = None,
-                 agent_context: str = 'chat'):
+                 agent_context: str = 'chat', is_admin: bool = False):
         self.pool = pool
         self.user_email = user_email
         self.user_id = user_id
         self.model_id = model_id
         self.agent_context = agent_context
         self.session_id = session_id
+        self.is_admin = is_admin
         self._container_id: str | None = None
         self._shared_dir: str | None = None
         self._server_sock: socket.socket | None = None
@@ -224,7 +225,15 @@ class SandboxSession:
                 rows = future.result(timeout=QUERY_TIMEOUT_S)
                 return {"type": "db_result", "rows": rows}
             except Exception as e:
-                return {"type": "db_result", "error": str(e)}
+                error = str(e)
+                err_lower = error.lower()
+                if "does not exist" in err_lower and ("column" in err_lower or "relation" in err_lower):
+                    error += (
+                        '\nHINT: Wrong column or table name. '
+                        'Run db("SELECT get_agent_schema()") to see available views and columns, '
+                        'or db("SELECT get_full_schema()") for the complete database schema.'
+                    )
+                return {"type": "db_result", "error": error}
 
         if msg_type == "file_info":
             future = asyncio.run_coroutine_threadsafe(self._get_file_info(msg["id"]), loop)
@@ -316,6 +325,30 @@ class SandboxSession:
                 return {"type": "update_project_profile_result", "ok": True, "message": message}
             except Exception as e:
                 return {"type": "update_project_profile_result", "error": str(e)}
+
+        if msg_type == "create_prompt":
+            future = asyncio.run_coroutine_threadsafe(self._create_prompt(msg), loop)
+            try:
+                message = future.result(timeout=10)
+                return {"type": "create_prompt_result", "ok": True, "message": message}
+            except Exception as e:
+                return {"type": "create_prompt_result", "error": str(e)}
+
+        if msg_type == "update_prompt":
+            future = asyncio.run_coroutine_threadsafe(self._update_prompt(msg), loop)
+            try:
+                message = future.result(timeout=10)
+                return {"type": "update_prompt_result", "ok": True, "message": message}
+            except Exception as e:
+                return {"type": "update_prompt_result", "error": str(e)}
+
+        if msg_type == "delete_prompt":
+            future = asyncio.run_coroutine_threadsafe(self._delete_prompt(msg), loop)
+            try:
+                message = future.result(timeout=10)
+                return {"type": "delete_prompt_result", "ok": True, "message": message}
+            except Exception as e:
+                return {"type": "delete_prompt_result", "error": str(e)}
 
         if msg_type == "web_search":
             query = (msg.get("query") or "")[:WEB_SEARCH_MAX_QUERY_LEN]
@@ -523,6 +556,142 @@ class SandboxSession:
             WHERE tw_project_id = $2
         """, markdown, project_id)
         return f"Profile updated ({new_len} chars)"
+
+    _VALID_PROMPT_CATEGORIES = frozenset(['prompt', 'skill', 'doc'])
+
+    async def _create_prompt(self, msg: dict) -> str:
+        """Create a prompt template with ownership rules."""
+        pt_id = msg["id"]
+        title = msg["title"]
+        category = msg["category"]
+        content = msg["content"]
+        description = msg.get("description")
+        summary = msg.get("summary")
+        hidden = msg.get("hidden", False)
+        tags = msg.get("tags") or []
+        prompt_role = msg.get("prompt_role")
+        db_functions = msg.get("db_functions") or []
+        py_functions = msg.get("py_functions") or []
+        system = msg.get("system", False)
+
+        if category not in self._VALID_PROMPT_CATEGORIES:
+            raise ValueError(f"Invalid category: {category} (must be prompt/skill/doc)")
+        if not pt_id or not pt_id.strip():
+            raise ValueError("id is required")
+        if not title or not title.strip():
+            raise ValueError("title is required")
+
+        expected_prefix = category + "."
+        if not pt_id.startswith(expected_prefix):
+            raise ValueError(f"id must start with '{expected_prefix}' for category '{category}'")
+
+        existing = await self.pool.fetchval(
+            "SELECT id FROM prompt_templates WHERE id = $1", pt_id
+        )
+        if existing:
+            raise ValueError(f"Prompt template '{pt_id}' already exists")
+
+        if system:
+            if not self.is_admin:
+                raise PermissionError("Only admins can create system prompt templates")
+            owner_id = None
+            is_system = True
+        else:
+            owner_id = self.user_id
+            is_system = False
+
+        await self.pool.execute("""
+            INSERT INTO prompt_templates (id, owner_id, title, category, content, description,
+                                          summary, hidden, tags, prompt_role, db_functions, py_functions, is_system)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        """, pt_id, owner_id, title, category, content, description,
+             summary, hidden, tags, prompt_role, db_functions, py_functions, is_system)
+        kind = "system" if is_system else "personal"
+        return f"Created {kind} {category} '{pt_id}'"
+
+    async def _update_prompt(self, msg: dict) -> str:
+        """Update a prompt template. Never changes owner_id/is_system."""
+        pt_id = msg["id"]
+        if not pt_id:
+            raise ValueError("id is required")
+
+        row = await self.pool.fetchrow(
+            "SELECT owner_id, is_system FROM prompt_templates WHERE id = $1", pt_id
+        )
+        if not row:
+            raise ValueError(f"Prompt template '{pt_id}' not found")
+
+        owner_id = str(row["owner_id"]) if row["owner_id"] else None
+        if owner_id is None:
+            if not self.is_admin:
+                raise PermissionError("Only admins can edit system prompt templates")
+        elif owner_id != self.user_id:
+            raise PermissionError("You can only edit your own prompt templates")
+
+        sets, params = [], [pt_id]
+        idx = 2
+
+        for field in ("title", "content", "description", "summary"):
+            if field in msg and msg[field] is not None:
+                sets.append(f"{field} = ${idx}")
+                params.append(msg[field])
+                idx += 1
+
+        if "category" in msg and msg["category"] is not None:
+            cat = msg["category"]
+            if cat not in self._VALID_PROMPT_CATEGORIES:
+                raise ValueError(f"Invalid category: {cat}")
+            sets.append(f"category = ${idx}")
+            params.append(cat)
+            idx += 1
+
+        if "hidden" in msg:
+            sets.append(f"hidden = ${idx}")
+            params.append(bool(msg["hidden"]))
+            idx += 1
+
+        if "prompt_role" in msg:
+            sets.append(f"prompt_role = ${idx}")
+            params.append(msg["prompt_role"])
+            idx += 1
+
+        for arr_field in ("tags", "db_functions", "py_functions"):
+            if arr_field in msg:
+                sets.append(f"{arr_field} = ${idx}")
+                params.append(msg[arr_field] or [])
+                idx += 1
+
+        if not sets:
+            raise ValueError("Nothing to update — provide at least one field")
+
+        await self.pool.execute(
+            f"UPDATE prompt_templates SET {', '.join(sets)} WHERE id = $1", *params
+        )
+        return f"Updated prompt template '{pt_id}'"
+
+    async def _delete_prompt(self, msg: dict) -> str:
+        """Delete a prompt template. is_system rows cannot be deleted."""
+        pt_id = msg["id"]
+        if not pt_id:
+            raise ValueError("id is required")
+
+        row = await self.pool.fetchrow(
+            "SELECT owner_id, is_system FROM prompt_templates WHERE id = $1", pt_id
+        )
+        if not row:
+            raise ValueError(f"Prompt template '{pt_id}' not found")
+        if row["is_system"]:
+            raise ValueError(f"Cannot delete system template '{pt_id}' (is_system=true)")
+
+        owner_id = str(row["owner_id"]) if row["owner_id"] else None
+        if owner_id is None:
+            if not self.is_admin:
+                raise PermissionError("Only admins can delete system prompt templates")
+        elif owner_id != self.user_id:
+            raise PermissionError("You can only delete your own prompt templates")
+
+        await self.pool.execute("DELETE FROM prompt_templates WHERE id = $1", pt_id)
+        return f"Deleted prompt template '{pt_id}'"
 
     async def _web_search(self, query: str, depth: str = "standard") -> dict:
         """Search the web via Linkup API. Returns results + cost."""

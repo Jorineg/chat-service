@@ -9,6 +9,7 @@ from typing import Any, AsyncGenerator
 from openai import AsyncOpenAI, APIError
 
 from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
+from ..api_log import log_request, log_response
 
 logger = logging.getLogger("ibhelm.chat.provider.openai_compat")
 
@@ -61,8 +62,8 @@ class OpenAICompatProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
 
-    def build_system_prompt(self, static: str, dynamic: str) -> str:
-        return f"{static}\n\n{dynamic}"
+    def build_system_prompt(self, text: str) -> str:
+        return text
 
     def build_tool_definition(self, name: str, description: str, input_schema: dict) -> dict:
         return {
@@ -221,10 +222,13 @@ class OpenAICompatProvider(LLMProvider):
             "stream_options": {"include_usage": True},
         }
 
+        log_request("openai_compat", model_id, all_messages, system=system, tools=tools)
+
         try:
             stream = await self.client.chat.completions.create(**kwargs)
         except APIError as e:
             logger.error("OpenAI-compat API error: %s", e)
+            log_response("openai_compat", model_id, error=str(e))
             yield {"type": "turn_end", "stop_reason": "error", "error": str(e),
                    "tool_calls": [], "usage": _empty_usage()}
             return
@@ -275,6 +279,7 @@ class OpenAICompatProvider(LLMProvider):
                     finish_reason = choice.finish_reason
         except APIError as e:
             logger.error("OpenAI-compat streaming error: %s", e)
+            log_response("openai_compat", model_id, error=str(e))
             yield {"type": "turn_end", "stop_reason": "error", "error": str(e),
                    "tool_calls": [], "usage": usage or _empty_usage()}
             return
@@ -299,6 +304,8 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason = "tool_calls"
 
         stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
+        log_response("openai_compat", model_id, tool_calls=tool_calls,
+                     usage=usage or _empty_usage(), finish_reason=finish_reason)
         yield {"type": "turn_end", "stop_reason": stop,
                "tool_calls": tool_calls, "usage": usage or _empty_usage()}
 
