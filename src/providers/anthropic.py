@@ -6,8 +6,8 @@ from typing import Any, AsyncGenerator
 
 import anthropic
 
-from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
-from ..api_log import log_request, log_response
+from .base import LLMProvider, format_user_message, truncate_tool_output
+from ..api_log import log_request, log_response, log_raw
 
 logger = logging.getLogger("ibhelm.chat.provider.anthropic")
 
@@ -24,7 +24,7 @@ class AnthropicProvider(LLMProvider):
     def build_tool_definition(self, name: str, description: str, input_schema: dict) -> dict:
         return {"name": name, "description": description, "input_schema": input_schema}
 
-    def build_api_messages(self, db_messages: list[dict]) -> list[dict]:
+    def build_api_messages(self, db_messages: list[dict], user_template: str | None = None) -> list[dict]:
         api_msgs = []
         for msg in db_messages:
             role = msg["role"]
@@ -32,8 +32,8 @@ class AnthropicProvider(LLMProvider):
             blocks = msg.get("blocks")
 
             if role == "user":
-                text = inject_file_context(content, msg.get("files") or [])
-                api_msgs.append({"role": "user", "content": inject_timestamp(text, msg.get("created_at"))})
+                text = format_user_message(content, msg.get("files") or [], msg.get("created_at"), user_template)
+                api_msgs.append({"role": "user", "content": text})
                 continue
 
             if not blocks:
@@ -173,12 +173,18 @@ class AnthropicProvider(LLMProvider):
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_config["budget_tokens"]}
 
         log_request("anthropic", model_id, messages, system=system, tools=tools)
+        log_raw("request", {k: v for k, v in kwargs.items()})
 
         max_retries = 5
         for attempt in range(max_retries + 1):
             try:
                 async with self.client.messages.stream(**kwargs) as stream:
                     async for event in stream:
+                        try:
+                            raw = event.model_dump(exclude_none=True) if hasattr(event, 'model_dump') else {"type": event.type}
+                        except Exception:
+                            raw = {"type": getattr(event, 'type', 'unknown')}
+                        log_raw("event", raw)
                         if event.type == "content_block_delta":
                             if hasattr(event.delta, 'text'):
                                 yield {"type": "text", "content": event.delta.text}
@@ -219,6 +225,8 @@ class AnthropicProvider(LLMProvider):
             "cache_read_input_tokens": getattr(response.usage, 'cache_read_input_tokens', 0) or 0,
             "cache_creation_input_tokens": getattr(response.usage, 'cache_creation_input_tokens', 0) or 0,
         }
+
+        log_raw("final_response", response.model_dump(exclude_none=True))
 
         stop = "tool_use" if response.stop_reason == "tool_use" else "end_turn"
         log_response("anthropic", model_id, tool_calls=tool_calls, usage=usage,

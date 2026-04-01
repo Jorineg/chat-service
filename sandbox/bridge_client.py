@@ -90,6 +90,19 @@ class BridgeClient:
             raise RuntimeError(resp["error"])
         return DbResult(resp["rows"])
 
+    def load_skill(self, skill_id: str = "", *, id: str = "") -> '_Loaded':
+        """Load a skill/doc from the template system. Always prints the content."""
+        skill_id = skill_id or id
+        if not skill_id:
+            raise ValueError("skill_id is required")
+        result = self.db("SELECT load_skill($1)", skill_id)
+        text = result[0][list(result[0].keys())[0]] if result else ""
+        if not text or text.startswith("Error:"):
+            raise ValueError(text or f"Skill '{skill_id}' not found")
+        result._printed = True
+        print(text)
+        return _Loaded(skill_id)
+
     def file_info(self, file_id=None, **kwargs) -> dict:
         file_id = file_id or kwargs.get("id") or kwargs.get("id_or_path")
         resp = self._request("file_info", {"id": file_id})
@@ -172,27 +185,32 @@ class BridgeClient:
             raise RuntimeError(resp["error"])
         return resp.get("message", "ok")
 
-    def create_prompt(self, id, title, category, content, description=None, system=False) -> str:
+    def create_prompt(self, id, title, category, content, summary=None,
+                      hidden=False, tags=None, prompt_role=None,
+                      db_functions=None, py_functions=None, system=False) -> str:
         """Create a prompt template. system=True requires admin (sets owner_id=NULL, is_system=TRUE)."""
         payload = {"id": id, "title": title, "category": category, "content": content, "system": system}
-        if description is not None:
-            payload["description"] = description
+        for k, v in [("summary", summary), ("hidden", hidden), ("tags", tags),
+                      ("prompt_role", prompt_role), ("db_functions", db_functions),
+                      ("py_functions", py_functions)]:
+            if v is not None and v is not False:
+                payload[k] = v
         resp = self._request("create_prompt", payload)
         if resp.get("error"):
             raise RuntimeError(resp["error"])
         return resp.get("message", "ok")
 
-    def update_prompt(self, id, title=None, content=None, description=None, category=None) -> str:
+    def update_prompt(self, id, title=None, content=None, category=None,
+                      summary=None, hidden=None, tags=None, prompt_role=None,
+                      db_functions=None, py_functions=None) -> str:
         """Update a prompt template. Only own rows or system rows (admin)."""
         payload = {"id": id}
-        if title is not None:
-            payload["title"] = title
-        if content is not None:
-            payload["content"] = content
-        if description is not None:
-            payload["description"] = description
-        if category is not None:
-            payload["category"] = category
+        for k, v in [("title", title), ("content", content), ("category", category),
+                      ("summary", summary), ("hidden", hidden), ("tags", tags),
+                      ("prompt_role", prompt_role), ("db_functions", db_functions),
+                      ("py_functions", py_functions)]:
+            if v is not None:
+                payload[k] = v
         resp = self._request("update_prompt", payload)
         if resp.get("error"):
             raise RuntimeError(resp["error"])
@@ -225,6 +243,20 @@ class BridgeClient:
             raise RuntimeError(resp["error"])
         return resp["markdown"]
 
+    def update_settings(self, scope=None, patch=None, **kwargs):
+        """Update admin or user settings via deep merge. Empty patch {} = read current."""
+        scope = scope or kwargs.get("scope")
+        if scope not in ("admin", "user"):
+            raise ValueError("scope must be 'admin' or 'user'")
+        if patch is None:
+            patch = kwargs.get("patch", {})
+        resp = self._request("update_settings", {"scope": scope, "patch": patch})
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        if "settings" in resp:
+            return resp["settings"]
+        return resp.get("message", "ok")
+
     def describe_image(self, ref=None, question=None, page=None, **kwargs) -> str:
         ref = ref or kwargs.get("id_or_path") or kwargs.get("id") or kwargs.get("path")
         question = question or kwargs.get("q") or kwargs.get("prompt")
@@ -237,6 +269,18 @@ class BridgeClient:
         if resp.get("error"):
             raise RuntimeError(resp["error"])
         return resp["description"]
+
+
+class _Loaded:
+    """Sentinel returned by load_skill() — prints nothing to avoid double output."""
+    def __init__(self, skill_id: str):
+        self._id = skill_id
+    def __repr__(self):
+        return ""
+    def __str__(self):
+        return ""
+    def __bool__(self):
+        return True
 
 
 _PAGE_SIZE = 30
@@ -422,6 +466,12 @@ class DbResult:
     List compat: r[i], len(r), for row in r, bool(r)
     """
 
+    _unprinted: list['DbResult'] = []
+
+    @classmethod
+    def _reset_tracking(cls):
+        cls._unprinted.clear()
+
     def __init__(self, rows: list[dict], page_size: int = _PAGE_SIZE,
                  page_budget: int = _PAGE_BUDGET):
         self._rows = rows
@@ -430,6 +480,8 @@ class DbResult:
         self._page = 0
         self._total_chars: int | None = None
         self._var_name: str | None = None
+        self._printed = False
+        DbResult._unprinted.append(self)
 
     def _get_total_chars(self) -> int:
         if self._total_chars is None:
@@ -437,6 +489,7 @@ class DbResult:
         return self._total_chars
 
     def __repr__(self):
+        self._printed = True
         if not self._rows:
             return "rows[0]{}: (empty)"
         fields = list(self._rows[0].keys())

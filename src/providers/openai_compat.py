@@ -8,8 +8,8 @@ from typing import Any, AsyncGenerator
 
 from openai import AsyncOpenAI, APIError
 
-from .base import LLMProvider, inject_timestamp, inject_file_context, truncate_tool_output
-from ..api_log import log_request, log_response
+from .base import LLMProvider, format_user_message, truncate_tool_output
+from ..api_log import log_request, log_response, log_raw
 
 logger = logging.getLogger("ibhelm.chat.provider.openai_compat")
 
@@ -71,7 +71,7 @@ class OpenAICompatProvider(LLMProvider):
             "function": {"name": name, "description": description, "parameters": input_schema},
         }
 
-    def build_api_messages(self, db_messages: list[dict]) -> list[dict]:
+    def build_api_messages(self, db_messages: list[dict], user_template: str | None = None) -> list[dict]:
         api_msgs = []
         for msg in db_messages:
             role = msg["role"]
@@ -79,8 +79,8 @@ class OpenAICompatProvider(LLMProvider):
             blocks = msg.get("blocks")
 
             if role == "user":
-                text = inject_file_context(content, msg.get("files") or [])
-                api_msgs.append({"role": "user", "content": inject_timestamp(text, msg.get("created_at"))})
+                text = format_user_message(content, msg.get("files") or [], msg.get("created_at"), user_template)
+                api_msgs.append({"role": "user", "content": text})
                 continue
 
             if not blocks:
@@ -223,6 +223,7 @@ class OpenAICompatProvider(LLMProvider):
         }
 
         log_request("openai_compat", model_id, all_messages, system=system, tools=tools)
+        log_raw("request", {k: v for k, v in kwargs.items() if k != "stream"})
 
         try:
             stream = await self.client.chat.completions.create(**kwargs)
@@ -237,9 +238,12 @@ class OpenAICompatProvider(LLMProvider):
         finish_reason = None
         usage = None
         reasoning_buffer = ""
+        content_buffer = ""
 
         try:
             async for chunk in stream:
+                log_raw("chunk", chunk.model_dump(exclude_none=True))
+
                 if chunk.usage:
                     usage = {
                         "input_tokens": chunk.usage.prompt_tokens or 0,
@@ -255,6 +259,7 @@ class OpenAICompatProvider(LLMProvider):
                 delta = choice.delta
 
                 if delta.content:
+                    content_buffer += delta.content
                     yield {"type": "text", "content": delta.content}
 
                 if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
@@ -297,16 +302,30 @@ class OpenAICompatProvider(LLMProvider):
             tool_calls.append(entry)
 
         # Fallback: recover tool calls leaked into reasoning content
-        if not tool_calls and finish_reason != "tool_calls" and reasoning_buffer:
+        if not tool_calls and reasoning_buffer:
             leaked = _parse_leaked_tool_calls(reasoning_buffer)
             if leaked:
                 tool_calls = leaked
                 finish_reason = "tool_calls"
 
+        # Some models (GLM-4.7) return finish_reason=tool_calls with empty array —
+        # likely the model hallucinated a direct function call that the provider stripped.
+        ghost = finish_reason == "tool_calls" and not tool_calls
+        if ghost:
+            logger.warning(
+                "Ghost tool_calls from %s: %d output tokens, reasoning=%d chars",
+                model_id, (usage or {}).get("output_tokens", 0), len(reasoning_buffer),
+            )
+            finish_reason = "stop"
+
         stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
-        log_response("openai_compat", model_id, tool_calls=tool_calls,
-                     usage=usage or _empty_usage(), finish_reason=finish_reason)
-        yield {"type": "turn_end", "stop_reason": stop,
+        log_response("openai_compat", model_id,
+                     content=content_buffer or None,
+                     tool_calls=tool_calls,
+                     usage=usage or _empty_usage(),
+                     finish_reason=finish_reason,
+                     reasoning=reasoning_buffer or None)
+        yield {"type": "turn_end", "stop_reason": stop, "ghost_tool_call": ghost,
                "tool_calls": tool_calls, "usage": usage or _empty_usage()}
 
     async def generate_simple(self, model_id: str, prompt: str, max_tokens: int) -> str:

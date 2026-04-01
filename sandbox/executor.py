@@ -160,6 +160,7 @@ def _build_env(bridge: BridgeClient) -> dict:
 
     return {
         "db": bridge.db,
+        "load_skill": bridge.load_skill,
         "file_info": bridge.file_info,
         "file_text": file_text,
         "file_image": file_image,
@@ -176,6 +177,7 @@ def _build_env(bridge: BridgeClient) -> dict:
         "create_prompt": bridge.create_prompt,
         "update_prompt": bridge.update_prompt,
         "delete_prompt": bridge.delete_prompt,
+        "update_settings": bridge.update_settings,
         "_pending_images": pending_images,
     }
 
@@ -187,16 +189,39 @@ def _tag_dbresult_vars(env: dict):
             val._var_name = name
 
 
+def _auto_display_unprinted() -> str | None:
+    """Auto-display DbResult objects that were created but never printed."""
+    unprinted = [r for r in DbResult._unprinted if not r._printed]
+    if not unprinted:
+        return None
+    parts = [repr(r) for r in unprinted]
+    body = "\n---\n".join(parts)
+    return body + "\n\n(auto-displayed — always use print() to see query results)"
+
+
 def _run_code(code: str, env: dict) -> dict:
     """Execute code with full Python access."""
     captured = StringIO()
     old_stdout = sys.stdout
     sys.stdout = captured
+    DbResult._reset_tracking()
     try:
         exec(compile(code, "<code>", "exec"), env)
         _tag_dbresult_vars(env)
 
         output = captured.getvalue()
+
+        if not output.strip():
+            auto = _auto_display_unprinted()
+            if auto:
+                output = auto
+        else:
+            unprinted = [r for r in DbResult._unprinted
+                         if not r._printed and r._var_name]
+            if unprinted:
+                names = ", ".join(r._var_name for r in unprinted)
+                output += f"\n\n(Note: {names} not printed — use print() to see)"
+
         if len(output) > MAX_OUTPUT:
             output = output[:MAX_OUTPUT] + f"\n... (truncated, {len(output)} total chars)"
 

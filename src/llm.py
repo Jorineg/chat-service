@@ -22,6 +22,7 @@ _SANDBOX_REQUIREMENTS = (Path(__file__).resolve().parent.parent / "sandbox" / "r
 _LEAKED_TOKENS_RE = re.compile(r'\s*<\|tool_calls_section_begin\|>.*', re.DOTALL)
 _MARKDOWN_CODE_RE = re.compile(r'```(?:python|py)?\s*\n(.*?)```', re.DOTALL)
 _MENTION_RE = re.compile(r'@\[([^\]]+)\]\((\d+)\)')
+_TEMPLATE_RE = re.compile(r'/\[([^\]]+)\]\(([^)]+)\)')
 _USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -133,8 +134,8 @@ async def resolve_model(model_id: str | None, pool: asyncpg.Pool) -> dict:
     return configs[0]
 
 async def build_session_prompt(pool: asyncpg.Pool, user_email: str | None) -> str:
-    """Build the full system prompt from the chat.system_prompt template."""
-    return await tr.resolve(pool, "chat.system_prompt", {
+    """Build the full system prompt from the prompt.chat-system template."""
+    return await tr.resolve(pool, "prompt.chat-system", {
         "user_email": user_email or "unknown",
         "sandbox_requirements": _SANDBOX_REQUIREMENTS.replace('\n', ', '),
     })
@@ -189,6 +190,43 @@ async def enrich_project_mentions(pool: asyncpg.Pool, messages: list[dict]) -> N
         msg["content"] = msg["content"] + "\n" + "\n".join(sections)
 
 
+async def enrich_template_mentions(pool: asyncpg.Pool, messages: list[dict]) -> None:
+    """Find /[Title](template_id) mentions in user messages and append resolved content."""
+    all_ids: set[str] = set()
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        for match in _TEMPLATE_RE.finditer(msg.get("content") or ""):
+            all_ids.add(match.group(2))
+    if not all_ids:
+        return
+
+    resolved: dict[str, str] = {}
+    for tid in all_ids:
+        row = await pool.fetchval("SELECT load_skill($1)", tid)
+        if row:
+            resolved[tid] = row
+
+    for msg in messages:
+        if msg["role"] != "user":
+            continue
+        mentions = _TEMPLATE_RE.findall(msg.get("content") or "")
+        if not mentions:
+            continue
+        sections = []
+        for title, tid in mentions:
+            content = resolved.get(tid)
+            if content and not content.startswith("Error:"):
+                sections.append(
+                    f"\n[Auto-injected: /{tid} — \"{title}\"]\n{content}"
+                )
+            else:
+                sections.append(
+                    f"\n[Template \"{tid}\" not found or could not be loaded.]"
+                )
+        msg["content"] = msg["content"] + "\n" + "\n".join(sections)
+
+
 # ---------------------------------------------------------------------------
 # Streaming chat response with shared tool loop
 # ---------------------------------------------------------------------------
@@ -227,7 +265,11 @@ async def stream_chat_response(
     system = provider.build_system_prompt(system_prompt)
     tools = [provider.build_tool_definition(TOOL_NAME, TOOL_DESCRIPTION, TOOL_INPUT_SCHEMA)]
     await enrich_project_mentions(pool, messages)
-    api_messages = provider.build_api_messages(messages)
+    await enrich_template_mentions(pool, messages)
+    user_tpl = await pool.fetchval(
+        "SELECT content FROM prompt_templates WHERE id = 'prompt.chat-user'"
+    )
+    api_messages = provider.build_api_messages(messages, user_template=user_tpl)
 
     thinking_config = None
     if settings.ENABLE_THINKING and model_config.get("provider") == "anthropic":
@@ -252,6 +294,7 @@ async def stream_chat_response(
     for iteration in range(settings.MAX_TOOL_ITERATIONS):
         turn_tool_calls = []
         turn_text = ""
+        nudge_retry = False
 
         async for event in provider.stream_turn(
             api_messages, system, tools, active_model, max_tokens, thinking_config
@@ -288,6 +331,16 @@ async def stream_chat_response(
                 })
 
                 if event["stop_reason"] != "tool_use":
+                    # Ghost tool call: model wanted to call a tool but nothing came through.
+                    if event.get("ghost_tool_call") and iteration < settings.MAX_TOOL_ITERATIONS - 1:
+                        logger.warning("Ghost tool call detected, nudging model to retry (iter %d)", iteration)
+                        provider.append_assistant_turn(api_messages, turn_text, [])
+                        api_messages.append({"role": "user", "content":
+                            "[system: Your tool call was not received. "
+                            "Use the run_python tool with Python code to proceed.]"})
+                        nudge_retry = True
+                        break
+
                     # Check for code blocks in text that should be executed
                     if model_config.get("auto_execute_code_blocks") and turn_text:
                         code_blocks = _extract_code_blocks(turn_text)
@@ -304,7 +357,8 @@ async def stream_chat_response(
                     if not full_text and has_tool_results and iteration < settings.MAX_TOOL_ITERATIONS - 1:
                         logger.info("Nudging model for final text response (no text after tool calls)")
                         provider.append_assistant_turn(api_messages, turn_text, [])
-                        continue
+                        nudge_retry = True
+                        break
 
                     metadata = {**total_usage, "model": active_model}
                     if subcalls:
@@ -319,6 +373,9 @@ async def stream_chat_response(
 
                 # Strip leaked tool-call tokens from the last thinking block
                 _strip_leaked_tokens(all_blocks)
+
+        if nudge_retry:
+            continue
 
         if not turn_tool_calls:
             metadata = {**total_usage, "model": active_model}
@@ -450,7 +507,7 @@ async def stream_chat_response(
 
 async def generate_title(content: str, pool: asyncpg.Pool) -> str:
     """Generate a short title for a chat session from the first message."""
-    prompt = await tr.resolve(pool, "chat.title_generation", {"message_content": content[:500]})
+    prompt = await tr.resolve(pool, "prompt.title-gen", {"message_content": content[:500]})
 
     try:
         title_model_id = await get_app_setting(pool, "title_model_id")

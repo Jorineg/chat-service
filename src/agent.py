@@ -312,8 +312,8 @@ async def _run_event_agent(pool: asyncpg.Pool, project_id: int):
 
     vars_ = {"project_id": str(project_id), "event_ids": ",".join(str(i) for i in event_ids)}
     prompt, user_message = await asyncio.gather(
-        tr.resolve(pool, "agent.event_prompt"),
-        tr.resolve(pool, "agent.event_user_message", vars_),
+        tr.resolve(pool, "prompt.event-agent"),
+        tr.resolve(pool, "prompt.event-user", vars_),
     )
 
     logger.info("Running event agent for project %s — %d events", project_id, len(event_ids))
@@ -359,8 +359,8 @@ async def _run_bootstrap_agent(pool: asyncpg.Pool, project_id: int, request_id: 
     """Run the bootstrap agent to generate Tier 1+2 from scratch. Nudges if results not saved."""
     vars_ = {"project_id": str(project_id)}
     prompt, user_message = await asyncio.gather(
-        tr.resolve(pool, "agent.bootstrap_prompt", vars_),
-        tr.resolve(pool, "agent.bootstrap_user_message", vars_),
+        tr.resolve(pool, "prompt.bootstrap-agent", vars_),
+        tr.resolve(pool, "prompt.bootstrap-user", vars_),
     )
 
     async def _bootstrap_nudge(p: asyncpg.Pool) -> str | None:

@@ -43,8 +43,8 @@ SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "200"))
 EXEC_TIMEOUT_S = int(os.getenv("SANDBOX_EXEC_TIMEOUT", "60"))
 QUERY_TIMEOUT_S = 10
 WEB_SEARCH_MAX_QUERY_LEN = 400
-WEB_SEARCH_MAX_PER_SESSION = 10
-WEB_FETCH_MAX_PER_SESSION = 10
+WEB_SEARCH_MAX_PER_SESSION = 30
+WEB_FETCH_MAX_PER_SESSION = 100
 
 # Linkup API pricing (EUR, converted to USD at ~1.08)
 _LINKUP_COST_USD = {
@@ -350,6 +350,16 @@ class SandboxSession:
             except Exception as e:
                 return {"type": "delete_prompt_result", "error": str(e)}
 
+        if msg_type == "update_settings":
+            future = asyncio.run_coroutine_threadsafe(self._update_settings(msg), loop)
+            try:
+                result = future.result(timeout=10)
+                if isinstance(result, dict):
+                    return {"type": "update_settings_result", "settings": result}
+                return {"type": "update_settings_result", "ok": True, "message": result}
+            except Exception as e:
+                return {"type": "update_settings_result", "error": str(e)}
+
         if msg_type == "web_search":
             query = (msg.get("query") or "")[:WEB_SEARCH_MAX_QUERY_LEN]
             depth = msg.get("depth", "standard")
@@ -414,6 +424,8 @@ class SandboxSession:
                     await conn.execute("SELECT set_config('app.model_id', $1, true)", self.model_id)
                 await conn.execute("SELECT set_config('app.session_id', $1, true)", self.session_id)
                 await conn.execute("SELECT set_config('app.agent_context', $1, true)", self.agent_context)
+                if self.is_admin:
+                    await conn.execute("SELECT set_config('app.is_admin', 'true', true)")
                 if params:
                     rows = await conn.fetch(sql, *params)
                 else:
@@ -565,7 +577,6 @@ class SandboxSession:
         title = msg["title"]
         category = msg["category"]
         content = msg["content"]
-        description = msg.get("description")
         summary = msg.get("summary")
         hidden = msg.get("hidden", False)
         tags = msg.get("tags") or []
@@ -601,10 +612,10 @@ class SandboxSession:
             is_system = False
 
         await self.pool.execute("""
-            INSERT INTO prompt_templates (id, owner_id, title, category, content, description,
+            INSERT INTO prompt_templates (id, owner_id, title, category, content,
                                           summary, hidden, tags, prompt_role, db_functions, py_functions, is_system)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        """, pt_id, owner_id, title, category, content, description,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """, pt_id, owner_id, title, category, content,
              summary, hidden, tags, prompt_role, db_functions, py_functions, is_system)
         kind = "system" if is_system else "personal"
         return f"Created {kind} {category} '{pt_id}'"
@@ -631,7 +642,7 @@ class SandboxSession:
         sets, params = [], [pt_id]
         idx = 2
 
-        for field in ("title", "content", "description", "summary"):
+        for field in ("title", "content", "summary"):
             if field in msg and msg[field] is not None:
                 sets.append(f"{field} = ${idx}")
                 params.append(msg[field])
@@ -692,6 +703,42 @@ class SandboxSession:
 
         await self.pool.execute("DELETE FROM prompt_templates WHERE id = $1", pt_id)
         return f"Deleted prompt template '{pt_id}'"
+
+    async def _update_settings(self, msg: dict):
+        """Read or update admin/user settings via jsonb_deep_merge."""
+        scope = msg.get("scope")
+        patch = msg.get("patch") or {}
+
+        if scope not in ("admin", "user"):
+            raise ValueError("scope must be 'admin' or 'user'")
+
+        if scope == "admin":
+            if patch:
+                if not self.is_admin:
+                    raise PermissionError("Only admins can update admin settings")
+                await self.pool.execute(
+                    "UPDATE app_settings SET body = jsonb_deep_merge(body, $1::jsonb) WHERE lock = 'X'",
+                    json.dumps(patch),
+                )
+                return "Admin settings updated"
+            row = await self.pool.fetchval("SELECT body FROM app_settings WHERE lock = 'X'")
+            return json.loads(row) if isinstance(row, str) else (row or {})
+
+        if not self.user_id:
+            raise PermissionError("No user context")
+        if patch:
+            await self.pool.execute("""
+                INSERT INTO user_settings (user_id, settings)
+                VALUES ($1, jsonb_deep_merge('{}'::jsonb, $2::jsonb))
+                ON CONFLICT (user_id) DO UPDATE
+                SET settings = jsonb_deep_merge(user_settings.settings, $2::jsonb),
+                    db_updated_at = NOW()
+            """, self.user_id, json.dumps(patch))
+            return "User settings updated"
+        row = await self.pool.fetchval(
+            "SELECT settings FROM user_settings WHERE user_id = $1", self.user_id,
+        )
+        return json.loads(row) if isinstance(row, str) else (row or {})
 
     async def _web_search(self, query: str, depth: str = "standard") -> dict:
         """Search the web via Linkup API. Returns results + cost."""

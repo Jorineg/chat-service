@@ -37,25 +37,21 @@ def truncate_tool_output(output: str) -> str:
     )
 
 
-def inject_timestamp(content: str, created_at: str | None = None) -> str:
-    """Append a system timestamp to a user message for temporal context."""
+def _format_timestamp(created_at: str | None = None) -> str:
     if created_at:
         try:
             dt = datetime.fromisoformat(created_at)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            ts = dt.strftime("[%Y-%m-%d %H:%M UTC]")
+            return dt.strftime("[%Y-%m-%d %H:%M UTC]")
         except (ValueError, TypeError):
-            ts = datetime.now(timezone.utc).strftime("[%Y-%m-%d %H:%M UTC]")
-    else:
-        ts = datetime.now(timezone.utc).strftime("[%Y-%m-%d %H:%M UTC]")
-    return f"{content}\n{ts}"
+            pass
+    return datetime.now(timezone.utc).strftime("[%Y-%m-%d %H:%M UTC]")
 
 
-def inject_file_context(content: str, files: list[dict]) -> str:
-    """Append attached file metadata to a user message so the LLM knows about them."""
+def _format_file_context(files: list[dict]) -> str:
     if not files:
-        return content
+        return ""
     lines = ["\n\n[Attached files — pre-populated in /work/]"]
     for f in files:
         size = f.get("size_bytes") or 0
@@ -66,7 +62,27 @@ def inject_file_context(content: str, files: list[dict]) -> str:
         else:
             size_str = f"{size / (1024 * 1024):.1f} MB"
         lines.append(f"- {f['filename']} (id: {f['id']}, {f.get('mime_type', '?')}, {size_str})")
-    return content + "\n".join(lines)
+    return "\n".join(lines)
+
+
+# Default fallback if DB template not loaded
+_DEFAULT_USER_TPL = "${user_content}${file_context}\n${timestamp}"
+
+
+def format_user_message(
+    content: str,
+    files: list[dict],
+    created_at: str | None = None,
+    template: str | None = None,
+) -> str:
+    """Format a user message using the DB template (prompt.chat-user) with variable substitution."""
+    tpl = template or _DEFAULT_USER_TPL
+    return (
+        tpl
+        .replace("${user_content}", content)
+        .replace("${file_context}", _format_file_context(files))
+        .replace("${timestamp}", _format_timestamp(created_at))
+    )
 
 
 class LLMProvider(ABC):
@@ -77,7 +93,7 @@ class LLMProvider(ABC):
         """Build provider-specific system prompt representation."""
 
     @abstractmethod
-    def build_api_messages(self, db_messages: list[dict]) -> list[dict]:
+    def build_api_messages(self, db_messages: list[dict], user_template: str | None = None) -> list[dict]:
         """Convert neutral DB messages to provider-specific API message format."""
 
     @abstractmethod
